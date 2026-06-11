@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cjm-context-graph-layer"
+dynamic = ["version"]
+description = "Domain-neutral graph-aware layer for context graphs: deterministic node identity, spine and overlay grammar, spine-edit operations with effective-view projection, supersession resolution, idempotent emission/extension, and provenance-by-declaration."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
+authors = [{name = "Christian J. Mills", email = "9126128+cj-mills@users.noreply.github.com"}]
+keywords = ['nbdev']
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/cj-mills/cjm-context-graph-layer"
+Documentation = "https://cj-mills.github.io/cjm-context-graph-layer/"
+
+[project.entry-points.nbdev]
+cjm_context_graph_layer = "cjm_context_graph_layer._modidx:d"
+
+[tool.setuptools.dynamic]
+version = {attr = "cjm_context_graph_layer.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["cjm_context_graph_layer"]
+
+[tool.nbdev]

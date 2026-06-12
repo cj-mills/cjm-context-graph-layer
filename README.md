@@ -8,3 +8,498 @@
 ``` bash
 pip install cjm_context_graph_layer
 ```
+
+## Project Structure
+
+    nbs/
+    ├── declare.ipynb  # Provenance-by-declaration: host logic stays readable Python in the workflow core and DECLARES its provenance contributions as a `Derivation` event node (+ DERIVED_FROM input edges, PRODUCED output edges). This recovers audit completeness without the substrate executing host logic (pass-2 Thread 4's false-dichotomy resolution). The substrate stays untouched: declarations read composition/job ids from the outside.
+    ├── edits.ipynb    # The spine-edit operation vocabulary (`prune` / `replace_text` / `boundary_shift`) + supersession resolution + the effective-view projection. These are generic operations on any NEXT-chained text spine; correction workflows carry them in overlay-node payloads, and the projection interprets them at read time (migrates correction-core C11/C16 onto the layer).
+    ├── grammar.ipynb  # The domain-neutral context-graph grammar: spine relations (NEXT / PART_OF / STARTS_WITH, recurring fractally at every layer), overlay relations (SUPERSEDES / DERIVED_FROM / PRODUCED), root kinds, and the standardized attribution fields.
+    ├── identity.ipynb # Deterministic node/edge identity: UUIDv5 over canonical identity tuples (stage-5 ratified rule: a node's id derives from what makes it THE same node across re-derivation, never from its correctable content).
+    └── ops.ipynb      # Queue-touching layer operations: the shared `graph_task` helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and `extend_graph` — the one primitive every graph-extending workflow commits through. Deterministic ids (see `identity`) make idempotency a presence check instead of a search.
+
+Total: 5 notebooks
+
+## Module Dependencies
+
+``` mermaid
+graph LR
+    declare["declare<br/>declare"]
+    edits["edits<br/>edits"]
+    grammar["grammar<br/>grammar"]
+    identity["identity<br/>identity"]
+    ops["ops<br/>ops"]
+
+    declare --> grammar
+    grammar --> identity
+```
+
+*2 cross-module dependencies detected*
+
+## CLI Reference
+
+No CLI commands found in this project.
+
+## Module Overview
+
+Detailed documentation for each module in the project:
+
+### declare (`declare.ipynb`)
+
+> Provenance-by-declaration: host logic stays readable Python in the
+> workflow core and DECLARES its provenance contributions as a
+> `Derivation` event node (+ DERIVED_FROM input edges, PRODUCED output
+> edges). This recovers audit completeness without the substrate
+> executing host logic (pass-2 Thread 4’s false-dichotomy resolution).
+> The substrate stays untouched: declarations read composition/job ids
+> from the outside.
+
+#### Import
+
+``` python
+from cjm_context_graph_layer.declare import (
+    Derivation,
+    derivation_to_graph
+)
+```
+
+#### Functions
+
+``` python
+def derivation_to_graph(
+    d: Derivation,                       # The declared event
+    derivation_id: Optional[str] = None, # Explicit node id; None = generated (events are asserted, not re-derivable)
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (event node wire dict, edges)
+    """
+    Materialize a declaration as one event node + DERIVED_FROM / PRODUCED edges.
+    
+    The event node gets a GENERATED id (asserted/decision class — the
+    FLIP-TRIGGER-protected kind); its edges are deterministic per
+    (event, anchor, relation).
+    """
+```
+
+#### Classes
+
+``` python
+@dataclass
+class Derivation:
+    """
+    One host-logic transformation event, declared for the audit trail.
+    
+    Coarse-grained by design: the adopter passes the ids that anchor the event
+    (e.g. the Transcript nodes consumed + the Source whose spine was produced),
+    not every fine-grained output (per-node provenance already rides each
+    node's SourceRefs — duplicating it here would re-create topology, the
+    Thread-2 no-derived_from rule).
+    """
+    
+    actor: str  # Who ran it (e.g. "host:cjm-transcript-decomp-core")
+    method: str  # The transformation (e.g. "alignment-fold/v1")
+    input_ids: List[str] = field(...)  # Graph node ids consumed
+    output_ids: List[str] = field(...)  # Graph node ids produced (coarse anchors)
+    asserted_at: Optional[float]  # Unix timestamp; None = now at to_graph time
+    composition_id: Optional[str]  # Substrate composition run id, if any
+    job_ids: List[str] = field(...)  # Member job ids, if any
+    properties: Dict[str, Any] = field(...)  # Extra event properties
+```
+
+### edits (`edits.ipynb`)
+
+> The spine-edit operation vocabulary (`prune` / `replace_text` /
+> `boundary_shift`) + supersession resolution + the effective-view
+> projection. These are generic operations on any NEXT-chained text
+> spine; correction workflows carry them in overlay-node payloads, and
+> the projection interprets them at read time (migrates correction-core
+> C11/C16 onto the layer).
+
+#### Import
+
+``` python
+from cjm_context_graph_layer.edits import (
+    EDIT_OPS,
+    SpineEditError,
+    SpineUnit,
+    SpineEdit,
+    resolve_active,
+    project_effective_spine
+)
+```
+
+#### Functions
+
+``` python
+def resolve_active(
+    edit_ids: Iterable[str],                      # Candidate overlay node ids
+    supersedes_pairs: Iterable[Tuple[str, str]],  # (superseder_id, superseded_id) SUPERSEDES edges
+) -> Set[str]:  # Active (non-superseded) ids
+    """
+    Resolve the active set under append-only supersession.
+    
+    An id is superseded iff it is the TARGET of any SUPERSEDES edge — chains
+    resolve naturally (C supersedes B supersedes A leaves only C active), and
+    nothing is ever mutated (the C16 semantics, now layer-owned).
+    """
+```
+
+``` python
+def project_effective_spine(
+    units: List[SpineUnit],   # Ordered layer-0 spine (immutable input)
+    edits: List[SpineEdit],   # ACTIVE edits to apply (resolve supersession first)
+) -> List[SpineUnit]:  # New effective spine (input never mutated)
+    """
+    Project the effective view: layer-0 + active edits, resolved at read time.
+    
+    Edits apply in (created_at, edit_id) order over the evolving text state, so
+    later decisions see earlier ones' effects and replace_text latest-wins
+    emerges from ordering. Prunes drop positions at the end (a boundary_shift
+    or replace recorded before a later prune still applies cleanly).
+    boundary_shift is STRICT: if the current text no longer carries the moved
+    text verbatim at the boundary, the projection fails loudly rather than
+    guessing (SpineEditError).
+    """
+```
+
+#### Classes
+
+``` python
+class SpineEditError(ValueError):
+    "A spine edit could not be validated or applied (loud, never silent)."
+```
+
+``` python
+@dataclass
+class SpineUnit:
+    "Minimal projection unit: one spine position with its effective text."
+    
+    id: str  # Layer-0 segment node id
+    text: str  # Effective text at this position
+```
+
+``` python
+@dataclass
+class SpineEdit:
+    """
+    One spine-edit decision, as carried in an overlay node's payload.
+    
+    `op` semantics:
+    - `prune`: drop `targets` from the effective view (payload unused).
+    - `replace_text`: payload `{"text": ...}` replaces each target's text.
+    - `boundary_shift`: payload `{"boundary_after": <left segment id>,
+      "text": <moved text>, "direction": "push"|"pull"}` moves text across the
+      boundary between two adjacent FIXED positions (push = from the end of the
+      left unit to the start of the right; pull = the mirror). 1:1 alignment is
+      maintained continuously — count and positions never change.
+    """
+    
+    edit_id: str  # Carrying overlay node id (supersession anchor)
+    op: str  # One of EDIT_OPS
+    targets: List[str] = field(...)  # Layer-0 segment node ids the edit applies to
+    payload: Dict[str, Any] = field(...)  # Op-specific payload (see above)
+    created_at: float = 0.0  # Decision timestamp (application order + latest-wins tiebreak)
+    
+    def to_dict(self) -> Dict[str, Any]:  # Payload-ready dict
+            """Serialize for carriage in an overlay node payload."""
+            return {"edit_id": self.edit_id, "op": self.op, "targets": list(self.targets),
+        "Serialize for carriage in an overlay node payload."
+    
+    def from_dict(cls, d: Dict[str, Any]) -> "SpineEdit":  # Reconstructed edit
+        "Reconstruct from a payload dict."
+```
+
+#### Variables
+
+``` python
+EDIT_OPS
+```
+
+### grammar (`grammar.ipynb`)
+
+> The domain-neutral context-graph grammar: spine relations (NEXT /
+> PART_OF / STARTS_WITH, recurring fractally at every layer), overlay
+> relations (SUPERSEDES / DERIVED_FROM / PRODUCED), root kinds, and the
+> standardized attribution fields.
+
+#### Import
+
+``` python
+from cjm_context_graph_layer.grammar import (
+    ROOT_KINDS,
+    SpineRelations,
+    OverlayRelations,
+    attribution,
+    make_edge,
+    spine_edges,
+    grouped_spine_edges
+)
+```
+
+#### Functions
+
+``` python
+def attribution(
+    actor: str,                          # Who asserted/produced this (e.g. "human", "agent:claude", "capability:whisper")
+    method: Optional[str] = None,        # How (e.g. "transcribe", "alignment-fold/v1")
+    asserted_at: Optional[float] = None, # Unix timestamp; None = now
+) -> Dict[str, Any]:  # Standardized attribution property dict
+    """
+    Standardized attribution fields for derived/asserted nodes.
+    
+    Every derivation/assertion carries the same three fields, so audit reads
+    are uniform across workflows (P13's hand-rolled Connection attribution
+    graduated into the grammar).
+    """
+```
+
+``` python
+def make_edge(
+    source_id: str,                            # Edge source node id
+    target_id: str,                            # Edge target node id
+    relation_type: str,                        # Relation type (SpineRelations / OverlayRelations / domain)
+    properties: Optional[Dict[str, Any]] = None,  # Optional edge properties (e.g. {"role": "foreshadow"})
+    edge_id: Optional[str] = None,             # Explicit id; None = deterministic from the triple
+) -> Dict[str, Any]:  # Edge wire dict
+    "Build an edge wire dict with a deterministic id by default."
+```
+
+``` python
+def spine_edges(
+    parent_id: str,        # Parent node id
+    child_ids: List[str],  # Ordered child node ids
+) -> List[Dict[str, Any]]:  # Edge wire dicts
+    """
+    The uniform spine pattern at any layer: PART_OF child->parent for each
+    child + NEXT chain among children + STARTS_WITH parent->first child.
+    """
+```
+
+``` python
+def grouped_spine_edges(
+    groups: List[Tuple[str, List[str]]],  # (parent id, ordered child ids) per group, groups in spine order
+) -> List[Dict[str, Any]]:  # Edge wire dicts
+    """
+    Spine edges for a fine layer grouped under coarse parents.
+    
+    PART_OF goes to the OWNING parent; STARTS_WITH per parent -> its first
+    child (the coarse-seam jump anchor); the NEXT chain is GLOBAL across group
+    boundaries — fine continuity crosses coarse boundaries (agent span reads).
+    """
+```
+
+#### Classes
+
+``` python
+class SpineRelations:
+    """
+    Structural spine relations, reused fractally at every layer
+    (Source -> AudioSegment -> Segment today; series -> episode tomorrow).
+    """
+    
+    def all(cls) -> list:  # All spine relation types
+        "All spine relation types."
+```
+
+``` python
+class OverlayRelations:
+    """
+    Overlay/derivation relations — the trust grammar shared by every
+    workflow's graph extensions.
+    """
+    
+    def all(cls) -> list:  # All overlay relation types
+        "All overlay relation types."
+```
+
+#### Variables
+
+``` python
+ROOT_KINDS
+```
+
+### identity (`identity.ipynb`)
+
+> Deterministic node/edge identity: UUIDv5 over canonical identity
+> tuples (stage-5 ratified rule: a node’s id derives from what makes it
+> THE same node across re-derivation, never from its correctable
+> content).
+
+#### Import
+
+``` python
+from cjm_context_graph_layer.identity import (
+    LAYER_ID_NAMESPACE,
+    IDENTITY_SEPARATOR,
+    canonical_part,
+    derive_node_id,
+    derive_edge_id
+)
+```
+
+#### Functions
+
+``` python
+def canonical_part(
+    value: Union[str, int, float],  # One identity-tuple part
+) -> str:  # Canonical string form used inside the UUIDv5 name
+    """
+    Render one identity-tuple part canonically.
+    
+    Floats use `repr` (shortest round-trip — identical floats from the same
+    deterministic computation render identically); ints use `str`; strings pass
+    through. Anything else (including bool, whose int-ness is ambiguous) is
+    rejected loudly: identity inputs must be deliberate.
+    """
+```
+
+``` python
+def derive_node_id(
+    kind: str,  # Node kind discriminator (e.g. "source", "audio-segment")
+    *parts: Union[str, int, float],  # The identity tuple (positional, order-significant)
+) -> str:  # Deterministic UUID string (UUIDv5)
+    """
+    Derive a deterministic node id from a kind + identity tuple.
+    
+    Same kind + same parts always yields the same id, across processes and
+    re-derivations — re-derived graphs reproduce their node ids, so cross-graph
+    references survive a rebuild (the G3a fix made structural). Content hashes
+    belong in SourceRefs, NOT here: identity is position/provenance, never the
+    correctable content.
+    """
+```
+
+``` python
+def derive_edge_id(
+    source_id: str,      # Edge source node id
+    target_id: str,      # Edge target node id
+    relation_type: str,  # Relation type (e.g. "NEXT")
+) -> str:  # Deterministic UUID string
+    """
+    Derive a deterministic edge id from (source, target, relation).
+    
+    Layer-0 structural edges are unique per (source, target, relation), so the
+    triple IS the identity — re-derivation reproduces edge ids the same way it
+    reproduces node ids.
+    """
+```
+
+#### Variables
+
+``` python
+LAYER_ID_NAMESPACE
+IDENTITY_SEPARATOR = '\x1f'
+```
+
+### ops (`ops.ipynb`)
+
+> Queue-touching layer operations: the shared `graph_task` helper (task
+> channel), idempotent emission (emit-if-absent + verify-if-present),
+> and `extend_graph` — the one primitive every graph-extending workflow
+> commits through. Deterministic ids (see `identity`) make idempotency a
+> presence check instead of a search.
+
+#### Import
+
+``` python
+from cjm_context_graph_layer.ops import (
+    GRAPH_TASK,
+    graph_task,
+    GraphIntegrityError,
+    node_identity_mismatch,
+    partition_by_presence,
+    ExtendResult,
+    extend_graph
+)
+```
+
+#### Functions
+
+``` python
+async def graph_task(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability instance id
+    method: str,      # Adapter method (e.g. "query_nodes", "add_nodes")
+    **kwargs,         # Typed-method kwargs (wire dicts ok; the in-worker adapter normalizes)
+) -> Any:  # Typed task result (wire-decoded host-side)
+    """
+    Invoke a graph-storage adapter method through the queue's task channel.
+    
+    THE shared copy: decomp-core and correction-core's per-core helpers migrate
+    onto this one (graph ops stay on the queue path for telemetry/cancellation
+    per D7/Thread-5 lock 5).
+    """
+```
+
+``` python
+def _source_hashes(sources: Optional[List[Any]]) -> Set[str]:
+    """Content-hash set from a node's sources (typed SourceRefs or wire dicts)."""
+    out: Set[str] = set()
+    "Content-hash set from a node's sources (typed SourceRefs or wire dicts)."
+```
+
+``` python
+def node_identity_mismatch(
+    existing: Any,            # Existing node (typed GraphNode or wire dict)
+    new: Dict[str, Any],      # New node wire dict being emitted
+) -> Optional[str]:  # Mismatch description, or None when compatible
+    "Verify-if-present check: label + sources content-hash set must match."
+```
+
+``` python
+def partition_by_presence(
+    items: List[Dict[str, Any]],  # Wire dicts carrying "id"
+    existing_ids: Set[str],       # Ids already present in the graph
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:  # (absent, present)
+    "Split wire dicts into absent (to add) and present (to verify)."
+```
+
+``` python
+async def extend_graph(
+    queue: JobQueue,              # Started job queue
+    graph_id: str,                # Graph-storage capability id
+    nodes: List[Dict[str, Any]],  # Node wire dicts (deterministic ids for layer-0; generated for decisions)
+    edges: List[Dict[str, Any]],  # Edge wire dicts
+) -> ExtendResult:  # Counts + created ids
+    """
+    Idempotently extend the graph: emit-if-absent + verify-if-present.
+    
+    Deterministic ids make idempotency a batched presence check (2 reads + at
+    most 2 writes per call — the C17 lesson applied to the write path): nodes
+    already present are verified against the new emission (label + provenance
+    content hashes) and a mismatch raises `GraphIntegrityError` LOUDLY; absent
+    nodes/edges are added. Cache-hit re-emission therefore collides into a
+    verified no-op (stress item 4), and a re-derived spine reproduces — never
+    duplicates — its layer-0 (stress item 1).
+    """
+```
+
+#### Classes
+
+``` python
+class GraphIntegrityError(RuntimeError):
+    """
+    An emitted node collided with an existing node of different identity content.
+    
+    Raised by verify-if-present: same deterministic id but mismatched label or
+    provenance content hashes means the identity tuple and the content have
+    diverged — never overwrite silently.
+    """
+```
+
+``` python
+@dataclass
+class ExtendResult:
+    "Outcome of one idempotent extend_graph commit."
+    
+    nodes_added: int = 0  # Nodes newly created
+    nodes_verified: int = 0  # Nodes already present, identity-verified
+    edges_added: int = 0  # Edges newly created
+    edges_existing: int = 0  # Edges already present (skipped)
+    added_node_ids: List[str] = field(...)  # Ids of created nodes
+    added_edge_ids: List[str] = field(...)  # Ids of created edges
+```
+
+#### Variables
+
+``` python
+GRAPH_TASK = 'graph-storage'  # The graph-storage adapter task (explicit task channel, stage 4)
+```

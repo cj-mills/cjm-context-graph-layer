@@ -12,7 +12,7 @@ __all__ = ['GRAPH_TASK', 'graph_task', 'GraphIntegrityError', 'node_identity_mis
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from cjm_plugin_system.core.queue import JobQueue, JobStatus
+from cjm_substrate.core.queue import JobQueue, JobStatus
 # Importing the typed query/result classes IS the host-side wire registration (F8).
 from cjm_context_graph_primitives.query import NodeQuery, EdgeQuery, NodeQueryResult, EdgeQueryResult
 

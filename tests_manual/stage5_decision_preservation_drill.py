@@ -22,8 +22,8 @@ import json
 import sys
 from pathlib import Path
 
-from cjm_plugin_system.core.manager import PluginManager
-from cjm_plugin_system.core.queue import JobQueue
+from cjm_substrate.core.manager import CapabilityManager
+from cjm_substrate.core.queue import JobQueue
 from cjm_context_graph_primitives.provenance import SourceRef
 from cjm_context_graph_primitives.locators import GraphNodeRef
 from cjm_context_graph_primitives.slices import FullContent
@@ -44,10 +44,10 @@ def node_props(node):
 
 
 async def main():
-    manager = PluginManager(search_paths=[Path(".cjm/manifests")])
+    manager = CapabilityManager(search_paths=[Path(".cjm/manifests")])
     manager.discover_manifests()
     meta = {m.name: m for m in manager.discovered}[GRAPH_ID]
-    assert manager.load_plugin(meta, config={"db_path": CORPUS}), "graph load failed"
+    assert manager.load_capability(meta, config={"db_path": CORPUS}), "graph load failed"
     queue = JobQueue(deps=manager)
     await queue.start()
     ok = True
@@ -116,7 +116,7 @@ async def main():
         ok = ok and res2.nodes_added == 0 and res2.edges_added == 0
     finally:
         await queue.stop()
-        manager.unload_plugin(GRAPH_ID)
+        manager.unload_capability(GRAPH_ID)
     print("DRILL", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

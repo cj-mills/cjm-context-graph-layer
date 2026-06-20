@@ -2,7 +2,7 @@
 """Stage-5 stress suite — the CR-18 graph-aware layer's standing validation.
 
 Items (per the ratified stage-5 stress list; see
-cjm-plugin-system/claude-docs/stage-5-evidence.md):
+cjm-substrate/claude-docs/stage-5-evidence.md):
 
   A. (operational, recorded in the ledger run log) re-derivation reference
      survival + emission idempotency at corpus scale — deterministic ids make
@@ -37,8 +37,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 from uuid import uuid4
 
-from cjm_plugin_system.core.manager import PluginManager
-from cjm_plugin_system.core.queue import JobQueue
+from cjm_substrate.core.manager import CapabilityManager
+from cjm_substrate.core.queue import JobQueue
 from cjm_context_graph_layer.ops import graph_task, extend_graph
 from cjm_context_graph_layer.grammar import OverlayRelations, make_edge, spine_edges, grouped_spine_edges
 from cjm_context_graph_layer.edits import SpineEdit, SpineUnit, resolve_active, project_effective_spine
@@ -121,10 +121,10 @@ def part_c_parity(seed: int = 5, rounds: int = 200) -> bool:
 # ---------------------------------------------------------------- Part B (runtime)
 async def part_b_concurrent_supersession(manifests_dir: str) -> bool:
     scratch = Path(tempfile.mkdtemp(prefix="stage5_scratch_")) / "scratch_graph.db"
-    manager = PluginManager(search_paths=[Path(manifests_dir)])
+    manager = CapabilityManager(search_paths=[Path(manifests_dir)])
     manager.discover_manifests()
     meta = {m.name: m for m in manager.discovered}[GRAPH_ID]
-    assert manager.load_plugin(meta, config={"db_path": str(scratch)}), "graph load failed"
+    assert manager.load_capability(meta, config={"db_path": str(scratch)}), "graph load failed"
     queue = JobQueue(deps=manager)
     await queue.start()
     ok = True
@@ -195,7 +195,7 @@ async def part_b_concurrent_supersession(manifests_dir: str) -> bool:
                     [(u.id, u.text) for u in out1] == [(u.id, u.text) for u in out2])
     finally:
         await queue.stop()
-        manager.unload_plugin(GRAPH_ID)
+        manager.unload_capability(GRAPH_ID)
     return ok
 
 

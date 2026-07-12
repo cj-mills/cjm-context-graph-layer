@@ -1,9 +1,0 @@
-project:
-  output-dir: _docs
-
-website:
-  title: "cjm-context-graph-layer"
-  site-url: "https://cj-mills.github.io/cjm-context-graph-layer"
-  description: "Domain-neutral graph-aware layer for context graphs: deterministic node identity, spine and overlay grammar, spine-edit operations with effective-view projection, supersession resolution, idempotent emission/extension, and provenance-by-declaration."
-  repo-branch: main
-  repo-url: "https://github.com/cj-mills/cjm-context-graph-layer"

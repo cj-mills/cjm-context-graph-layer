@@ -30,10 +30,14 @@ class SpineEdit:
     - `prune`: drop `targets` from the effective view (payload unused).
     - `replace_text`: payload `{"text": ...}` replaces each target's text.
     - `boundary_shift`: payload `{"boundary_after": <left segment id>,
-      "text": <moved text>, "direction": "push"|"pull"}` moves text across the
-      boundary between two adjacent FIXED positions (push = from the end of the
-      left unit to the start of the right; pull = the mirror). 1:1 alignment is
-      maintained continuously — count and positions never change.
+      "text": <moved WORDS, no boundary separators>, "direction": "push"|"pull"}`
+      moves whole words across the boundary between two adjacent FIXED positions
+      (push = from the end of the left unit to the start of the right; pull =
+      the mirror). Junctions are whitespace-NORMALIZED: the receiving side joins
+      with a single space, the vacated side collapses its boundary whitespace
+      (the corpus stores stripped segment texts — finding 58b2e0a0 falsified
+      pure concat-invariance). Word-stream 1:1 alignment is maintained — count
+      and positions never change.
     """
     edit_id: str                                  # Carrying overlay node id (supersession anchor)
     op: str                                       # One of EDIT_OPS
@@ -81,9 +85,11 @@ def project_effective_spine(
     later decisions see earlier ones' effects and replace_text latest-wins
     emerges from ordering. Prunes drop positions at the end (a boundary_shift
     or replace recorded before a later prune still applies cleanly).
-    boundary_shift is STRICT: if the current text no longer carries the moved
-    text verbatim at the boundary, the projection fails loudly rather than
-    guessing (SpineEditError).
+    boundary_shift is STRICT on the moved words (modulo boundary whitespace):
+    if the current text no longer carries them at the boundary, the projection
+    fails loudly rather than guessing (SpineEditError). Junctions normalize to
+    a single space (58b2e0a0: word-stream invariance replaced concat-invariance
+    once the stripped-text corpus convention falsified the junction premise).
     """
     order = {u.id: i for i, u in enumerate(units)}
     texts = {u.id: u.text for u in units}
@@ -99,8 +105,10 @@ def project_effective_spine(
                     texts[t] = new_text
         elif e.op == "boundary_shift":
             left = e.payload.get("boundary_after")
-            moved = e.payload.get("text", "")
+            moved = (e.payload.get("text") or "").strip()
             direction = e.payload.get("direction", "push")
+            if not moved:
+                raise SpineEditError(f"boundary_shift: empty moved text ({e.edit_id})")
             if left not in order:
                 raise SpineEditError(f"boundary_shift: unknown boundary_after {left!r}")
             idx = order[left]
@@ -108,15 +116,19 @@ def project_effective_spine(
                 raise SpineEditError("boundary_shift: no unit after the boundary")
             right = units[idx + 1].id
             if direction == "push":
-                if not texts[left].endswith(moved):
-                    raise SpineEditError(f"boundary_shift push: left text does not end with the moved text ({e.edit_id})")
-                texts[left] = texts[left][: len(texts[left]) - len(moved)]
-                texts[right] = moved + texts[right]
+                base = texts[left].rstrip()
+                if not base.endswith(moved):
+                    raise SpineEditError(f"boundary_shift push: left text does not end with the moved words ({e.edit_id})")
+                texts[left] = base[: len(base) - len(moved)].rstrip()
+                rtext = texts[right].lstrip()
+                texts[right] = f"{moved} {rtext}" if rtext else moved
             elif direction == "pull":
-                if not texts[right].startswith(moved):
-                    raise SpineEditError(f"boundary_shift pull: right text does not start with the moved text ({e.edit_id})")
-                texts[right] = texts[right][len(moved):]
-                texts[left] = texts[left] + moved
+                base = texts[right].lstrip()
+                if not base.startswith(moved):
+                    raise SpineEditError(f"boundary_shift pull: right text does not start with the moved words ({e.edit_id})")
+                texts[right] = base[len(moved):].lstrip()
+                ltext = texts[left].rstrip()
+                texts[left] = f"{ltext} {moved}" if ltext else moved
             else:
                 raise SpineEditError(f"boundary_shift: unknown direction {direction!r}")
 

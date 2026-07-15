@@ -10,9 +10,8 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - **`cjm_context_graph_layer.edits`** — The spine-edit operation vocabulary (prune / replace_text / boundary_shift) + supersession resolution + the effective-view projection. These are generic operations on any NEXT-chained text spine; correction workflows carry them in overlay-node payloads, and the projection interprets them at read time (migrates correction-core C11/C16 onto the layer).
 - **`cjm_context_graph_layer.grammar`** — The domain-neutral context-graph grammar: spine relations (NEXT / PART_OF / STARTS_WITH, recurring fractally at every layer), overlay relations (SUPERSEDES / DERIVED_FROM / PRODUCED), root kinds, and the standardized attribution fields.
 - **`cjm_context_graph_layer.identity`** — Deterministic node/edge identity: UUIDv5 over canonical identity tuples (stage-5 ratified rule: a node's id derives from what makes it THE same node across re-derivation, never from its correctable content).
+- **`cjm_context_graph_layer.journal`**
 - **`cjm_context_graph_layer.ops`** — Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search.
-- **`tests_manual.stage5_decision_preservation_drill`** — Stage-5 stress item 5: decision-preservation drill across the Document->Source reset.
-- **`tests_manual.validate_stage5_layer_e2e`** — Stage-5 stress suite — the CR-18 graph-aware layer's standing validation.
 
 ## API
 
@@ -44,6 +43,11 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `derive_edge_id` _function_ — Derive a deterministic edge id from (source, target, relation).
 - `derive_node_id` _function_ — Derive a deterministic node id from a kind + identity tuple.
 
+### `cjm_context_graph_layer.journal`
+
+- `genesis_export` _function_ — One-time whole-db GENESIS BASELINE: journal every node + edge as genesis ops.
+- `replay_journal` _function_ — Re-apply every journaled op in append order — the db-from-journal rebuild.
+
 ### `cjm_context_graph_layer.ops`
 
 - `ExtendResult` _class_ — Outcome of one idempotent extend_graph commit.
@@ -53,19 +57,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `node_identity_mismatch` _function_ — Verify-if-present check: label + sources content-hash set must match.
 - `partition_by_presence` _function_ — Split wire dicts into absent (to add) and present (to verify).
 
-### `tests_manual.stage5_decision_preservation_drill`
-
-- `main` _function_
-- `node_props` _function_
-
-### `tests_manual.validate_stage5_layer_e2e`
-
-- `check` _function_
-- `main` _function_
-- `oracle_projection` _function_ — The pre-stage-5 in-core algorithm: prune set + text overrides (conflict-free input).
-- `part_b_concurrent_supersession` _function_
-- `part_c_parity` _function_
-
 ## Dependencies
 
-**Depends on:** `cjm-context-graph-primitives`, `cjm-substrate`, `cjm-transcript-graph-schema`
+**Depends on:** `cjm-context-graph-primitives`, `cjm-substrate`
+**Used by:** `cjm-context-graph-projection`, `cjm-dev-graph-schema`, `cjm-markdown-decompose-core`, `cjm-notebook-decompose-core`, `cjm-transcript-correction-core`, `cjm-transcript-correction-tui`, `cjm-transcript-decomp-core`, `cjm-transcript-graph-schema`, `cjm-transcription-core`

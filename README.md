@@ -10,7 +10,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - **`cjm_context_graph_layer.edits`** — The spine-edit operation vocabulary (prune / replace_text / boundary_shift) + supersession resolution + the effective-view projection. These are generic operations on any NEXT-chained text spine; correction workflows carry them in overlay-node payloads, and the projection interprets them at read time (migrates correction-core C11/C16 onto the layer).
 - **`cjm_context_graph_layer.grammar`** — The domain-neutral context-graph grammar: spine relations (NEXT / PART_OF / STARTS_WITH, recurring fractally at every layer), overlay relations (SUPERSEDES / DERIVED_FROM / PRODUCED), root kinds, and the standardized attribution fields.
 - **`cjm_context_graph_layer.identity`** — Deterministic node/edge identity: UUIDv5 over canonical identity tuples (stage-5 ratified rule: a node's id derives from what makes it THE same node across re-derivation, never from its correctable content).
-- **`cjm_context_graph_layer.journal`**
+- **`cjm_context_graph_layer.journal`** — Journal replay for workflow graphs — the genesis baseline + the pluggable verb registry.
 - **`cjm_context_graph_layer.ops`** — Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search.
 
 ## API
@@ -45,8 +45,12 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 
 ### `cjm_context_graph_layer.journal`
 
+- `apply_wires` _function_ — The generic replay handler for wire-carrying ops (the single wires-replay authority).
 - `genesis_export` _function_ — One-time whole-db GENESIS BASELINE: journal every node + edge as genesis ops.
+- `journal_extend` _function_ — Idempotent extend + journal the DELTA — the pipeline-write append-through.
 - `replay_journal` _function_ — Re-apply every journaled op in append order — the db-from-journal rebuild.
+- `sidecar_journal_path` _function_ — The db's sidecar journal path (DEC ccbab9f5 point 3: placement is per-workflow,
+- `wires_handlers` _function_ — Convenience registry: every named verb replays via `apply_wires`.
 
 ### `cjm_context_graph_layer.ops`
 

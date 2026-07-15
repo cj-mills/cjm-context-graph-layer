@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional
 from cjm_context_graph_primitives.journal import append_op, read_journal
 from cjm_context_graph_primitives.query import EdgeQuery, NodeQuery
 
-from .ops import extend_graph, graph_task
+from .ops import extend_graph, ExtendResult, graph_task
 
 GENESIS_NODE = "genesis-node"  # One node's whole-db baseline op (args = the node wire dict)
 GENESIS_EDGE = "genesis-edge"  # One edge's whole-db baseline op (args = the edge wire dict)
@@ -100,3 +100,70 @@ async def replay_journal(
             await flush()
     await flush()
     return counts
+
+
+async def apply_wires(
+    queue: Any,             # Started job queue
+    graph_id: str,          # Graph-storage capability id
+    op: Dict[str, Any],     # A journaled op carrying {"wires": {"nodes": [...], "edges": [...]}}
+) -> None:
+    """The generic replay handler for wire-carrying ops (the single wires-replay authority).
+
+    Re-applies exactly what the op recorded through the idempotent extend —
+    present wires verify-collide into no-ops, so replay onto ANY db state
+    converges. Register it per domain verb via `wires_handlers`."""
+    w = op.get("wires") or {}
+    await extend_graph(queue, graph_id, w.get("nodes") or [], w.get("edges") or [])
+
+
+def sidecar_journal_path(
+    db_path: str,  # The workflow graph db path (e.g. .../context_graph.db)
+) -> str:  # The sidecar write-journal path next to it (.../context_graph.writes.jsonl)
+    """The db's sidecar journal path (DEC ccbab9f5 point 3: placement is per-workflow,
+    NEXT TO the db it is the source of truth for). Derived, never configured — one
+    less ambient default (the explicit-db-path guardrail extended to the journal)."""
+    if db_path.endswith(".db"):
+        return db_path[: -len(".db")] + ".writes.jsonl"
+    return db_path + ".writes.jsonl"
+
+
+def wires_handlers(
+    *verbs: str,  # Domain verbs whose ops carry wires
+) -> Dict[str, Any]:  # verb -> apply_wires, ready to merge into a replay handler registry
+    """Convenience registry: every named verb replays via `apply_wires`.
+
+    Keeps `replay_journal`'s loud-unknown-verb guarantee intact — verbs are
+    registered EXPLICITLY, never inferred from op shape."""
+    return dict.fromkeys(verbs, apply_wires)
+
+
+async def journal_extend(
+    queue: Any,                   # Started job queue
+    graph_id: str,                # Graph-storage capability id
+    nodes: List[Dict[str, Any]],  # Node wire dicts to extend with
+    edges: List[Dict[str, Any]],  # Edge wire dicts to extend with
+    journal_path: Optional[str] = None,  # Sidecar journal — append the DELTA op on success (None = unjournaled)
+    verb: str = "graph-extend",   # Domain verb for the journaled op
+    actor: str = "",              # Who produced the wires (e.g. "pipeline:cjm-transcription-core")
+    run: Optional[str] = None,    # Run id — pins the run manifest (derivation identity, DEC ccbab9f5 pt 8)
+    args: Optional[Dict[str, Any]] = None,  # Small semantic summary for the op (the dataset row)
+) -> ExtendResult:  # The extend result (adds + verified counts)
+    """Idempotent extend + journal the DELTA — the pipeline-write append-through.
+
+    Journals ONLY the wires this call actually ADDED: verified-present wires were
+    added by an earlier journaled op (or the genesis baseline), so re-runs over
+    cached content collide into verified no-ops AND leave the journal untouched —
+    the Derivation no-spam principle applied to the write journal. Appends ride
+    the bulk lane (fresh deterministic ids collide at REPLAY, not append time)."""
+    res = await extend_graph(queue, graph_id, nodes, edges)
+    if journal_path and (res.nodes_added or res.edges_added):
+        added_n = set(res.added_node_ids)
+        added_e = set(res.added_edge_ids)
+        op: Dict[str, Any] = {"verb": verb, "actor": actor,
+                              "args": dict(args or {}),
+                              "wires": {"nodes": [n for n in nodes if n["id"] in added_n],
+                                        "edges": [e for e in edges if e["id"] in added_e]}}
+        if run:
+            op["run"] = run
+        append_op(journal_path, op, dedup=False)
+    return res

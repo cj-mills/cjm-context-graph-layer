@@ -12,6 +12,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - **`cjm_context_graph_layer.identity`** — Deterministic node/edge identity: UUIDv5 over canonical identity tuples (stage-5 ratified rule: a node's id derives from what makes it THE same node across re-derivation, never from its correctable content).
 - **`cjm_context_graph_layer.journal`** — Journal replay for workflow graphs — the genesis baseline + the pluggable verb registry.
 - **`cjm_context_graph_layer.ops`** — Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search.
+- **`cjm_context_graph_layer.rebuild`**
 
 ## API
 
@@ -46,6 +47,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 ### `cjm_context_graph_layer.journal`
 
 - `apply_wires` _function_ — The generic replay handler for wire-carrying ops (the single wires-replay authority).
+- `composed_replay_handlers` _function_ — Union every installed core's replay registry (DEC 426658f1 — the d066826a fix).
 - `genesis_export` _function_ — One-time whole-db GENESIS BASELINE: journal every node + edge as genesis ops.
 - `journal_extend` _function_ — Idempotent extend + journal the DELTA — the pipeline-write append-through.
 - `replay_journal` _function_ — Re-apply every journaled op in append order — the db-from-journal rebuild.
@@ -60,6 +62,11 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `graph_task` _function_ — Invoke a graph-storage adapter method through the queue's task channel.
 - `node_identity_mismatch` _function_ — Verify-if-present check: label + sources content-hash set must match.
 - `partition_by_presence` _function_ — Split wire dicts into absent (to add) and present (to verify).
+
+### `cjm_context_graph_layer.rebuild`
+
+- `main` _function_ — The `cjm-workflow-rebuild` console entrypoint — one command, fresh db from journal.
+- `rebuild_db` _function_ — Rebuild `db_path` from the journal — substrate standup + composed replay.
 
 ## Dependencies
 

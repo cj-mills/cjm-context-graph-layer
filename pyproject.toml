@@ -14,7 +14,10 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = ['cjm-context-graph-primitives>=0.0.14', 'cjm-substrate>=0.0.51']
+dependencies = ['cjm-context-graph-primitives>=0.0.15', 'cjm-substrate>=0.0.51']
+
+[project.scripts]
+cjm-workflow-rebuild = "cjm_context_graph_layer.rebuild:main"
 
 [project.urls]
 Repository = "https://github.com/cj-mills/cjm-context-graph-layer"

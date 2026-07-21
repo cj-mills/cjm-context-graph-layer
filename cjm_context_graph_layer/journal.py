@@ -8,6 +8,7 @@ own verb handlers on replay (replay stays DOMAIN-OWNED); the op envelope + appen
 discipline live in `cjm_context_graph_primitives.journal`.
 """
 
+from importlib.metadata import entry_points
 from typing import Any, Callable, Dict, List, Optional
 
 from cjm_context_graph_primitives.journal import append_op, read_journal
@@ -18,6 +19,7 @@ from .ops import extend_graph, ExtendResult, graph_task
 GENESIS_NODE = "genesis-node"  # One node's whole-db baseline op (args = the node wire dict)
 GENESIS_EDGE = "genesis-edge"  # One edge's whole-db baseline op (args = the edge wire dict)
 _SCAN_LIMIT = 10_000_000       # Explicit whole-graph read limit (the full_graph_view recipe)
+REPLAY_GROUP = "cjm_context_graph_layer.replay"  # Entry-point group each core's registry factory joins
 
 
 async def genesis_export(
@@ -93,7 +95,9 @@ async def replay_journal(
             await flush()
             if verb not in handlers:
                 raise ValueError(f"replay_journal: no handler for verb {verb!r} — "
-                                 f"refusing to silently drop journaled knowledge")
+                                 f"refusing to silently drop journaled knowledge "
+                                 f"(is the core owning it installed in this env? "
+                                 f"composed_replay_handlers unions every installed registry)")
             await handlers[verb](queue, graph_id, op)
             counts[verb] = counts.get(verb, 0) + 1
         if len(pending_nodes) + len(pending_edges) >= batch:
@@ -167,3 +171,28 @@ async def journal_extend(
             op["run"] = run
         append_op(journal_path, op, dedup=False)
     return res
+
+
+def composed_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(queue, graph_id, op)
+    """Union every installed core's replay registry (DEC 426658f1 — the d066826a fix).
+
+    Scans the `REPLAY_GROUP` entry-point group: each domain core exports a
+    ZERO-ARG factory returning its verb->handler dict, so registration stays
+    explicit and domain-owned (DEC ccbab9f5) while ONE call composes a registry
+    that can replay the SHARED workflow journal. The union is complete exactly
+    when the env holds every emitting core (the 08e98a66 one-usage-env); a
+    missing core's verbs stay absent and `replay_journal` refuses loudly.
+    Collisions: the same handler OBJECT is legal — both pipeline cores register
+    `derivation` to the shared `apply_wires` — different objects refuse, naming
+    both owners (two cores claiming one verb with different semantics is a bug)."""
+    handlers: Dict[str, Any] = {}
+    owners: Dict[str, str] = {}
+    for ep in sorted(entry_points(group=REPLAY_GROUP), key=lambda e: e.name):
+        for verb, handler in ep.load()().items():
+            if verb in handlers and handlers[verb] is not handler:
+                raise ValueError(
+                    f"composed_replay_handlers: verb {verb!r} registered by both "
+                    f"{owners[verb]!r} and {ep.name!r} with DIFFERENT handlers — refusing")
+            handlers[verb] = handler
+            owners[verb] = ep.name
+    return handlers

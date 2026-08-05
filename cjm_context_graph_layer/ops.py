@@ -1,5 +1,6 @@
 """Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search."""
 
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -13,6 +14,14 @@ from cjm_substrate.core.queue import JobQueue, JobStatus
 _REGISTERED_WIRE_KINDS = (NodeQueryResult, EdgeQueryResult)
 
 GRAPH_TASK = "graph-storage"  # The graph-storage adapter task (explicit task channel, stage 4)
+
+# The REPLAY PROVENANCE WINDOW (finding 0d50b921): journal replay sets this to the
+# op's journaled ts around each re-applied write, and extend_graph stamps it as
+# created_at/updated_at on the wire dicts it ADDS — so a rebuild RESTORES temporal
+# provenance instead of clamping every node/edge to rebuild time. Async-scoped
+# (ContextVar), set ONLY by replay; live writes leave it None and the storage
+# capability stamps now() as before.
+PROVENANCE_TS: ContextVar[Optional[float]] = ContextVar("provenance_ts", default=None)
 
 
 async def graph_task(
@@ -106,6 +115,10 @@ async def extend_graph(
     duplicates — its layer-0 (stress item 1).
     """
     result = ExtendResult()
+    # Replay provenance window (0d50b921): inside replay, stamp the journaled ts
+    # onto everything ADDED so a rebuild restores true creation times. setdefault
+    # keeps any explicitly-carried stamp; live writes (ts None) stay capability-stamped.
+    ts = PROVENANCE_TS.get()
 
     if nodes:
         res = await graph_task(queue, graph_id, "query_nodes",
@@ -118,6 +131,10 @@ async def extend_graph(
                 raise GraphIntegrityError(f"node {n['id']}: {msg}")
         result.nodes_verified = len(present)
         if absent:
+            if ts is not None:
+                for n in absent:
+                    n.setdefault("created_at", ts)
+                    n.setdefault("updated_at", ts)
             added = await graph_task(queue, graph_id, "add_nodes", nodes=absent)
             result.added_node_ids = list(added or [])
             result.nodes_added = len(result.added_node_ids)
@@ -129,6 +146,10 @@ async def extend_graph(
         absent_edges = [e for e in edges if e["id"] not in existing_eids]
         result.edges_existing = len(edges) - len(absent_edges)
         if absent_edges:
+            if ts is not None:
+                for e in absent_edges:
+                    e.setdefault("created_at", ts)
+                    e.setdefault("updated_at", ts)
             added = await graph_task(queue, graph_id, "add_edges", edges=absent_edges)
             result.added_edge_ids = list(added or [])
             result.edges_added = len(result.added_edge_ids)

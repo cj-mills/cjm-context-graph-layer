@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 from cjm_context_graph_primitives.journal import append_op, read_journal
 from cjm_context_graph_primitives.query import EdgeQuery, NodeQuery
 
-from .ops import extend_graph, ExtendResult, graph_task
+from .ops import extend_graph, ExtendResult, graph_task, PROVENANCE_TS
 
 GENESIS_NODE = "genesis-node"  # One node's whole-db baseline op (args = the node wire dict)
 GENESIS_EDGE = "genesis-edge"  # One edge's whole-db baseline op (args = the edge wire dict)
@@ -68,7 +68,9 @@ async def replay_journal(
     their registered handler — replay stays DOMAIN-OWNED (DEC ccbab9f5 point 1) —
     and pending genesis batches flush BEFORE a handler runs, so every op sees its
     predecessors applied. An unregistered verb raises LOUDLY: silently skipping an
-    op would rebuild a db missing knowledge the journal holds."""
+    op would rebuild a db missing knowledge the journal holds. Temporal provenance
+    rides the replay (0d50b921): genesis args carry their op's journaled ts, and
+    the PROVENANCE_TS window is open around every domain handler."""
     handlers = handlers or {}
     counts: Dict[str, int] = {"nodes_added": 0, "nodes_verified": 0,
                               "edges_added": 0, "edges_existing": 0}
@@ -87,10 +89,16 @@ async def replay_journal(
 
     for op in read_journal(journal_path):
         verb = op.get("verb", "")
-        if verb == GENESIS_NODE:
-            pending_nodes.append(op["args"])
-        elif verb == GENESIS_EDGE:
-            pending_edges.append(op["args"])
+        if verb in (GENESIS_NODE, GENESIS_EDGE):
+            # Replay provenance (0d50b921): stamp the op's journaled ts onto what it
+            # adds — per-op HERE, not via the PROVENANCE_TS window, because a flush
+            # batch spans many ops' timestamps. setdefault keeps carried stamps;
+            # pre-ts journal records stay capability now()-stamped.
+            args = op["args"]
+            if op.get("ts") is not None:
+                args.setdefault("created_at", op["ts"])
+                args.setdefault("updated_at", op["ts"])
+            (pending_nodes if verb == GENESIS_NODE else pending_edges).append(args)
         else:
             await flush()
             if verb not in handlers:
@@ -98,7 +106,13 @@ async def replay_journal(
                                  f"refusing to silently drop journaled knowledge "
                                  f"(is the core owning it installed in this env? "
                                  f"composed_replay_handlers unions every installed registry)")
-            await handlers[verb](queue, graph_id, op)
+            # Domain handlers run inside the replay provenance window: whatever
+            # they mint through extend_graph / update_node re-stamps to op ts.
+            token = PROVENANCE_TS.set(op.get("ts"))
+            try:
+                await handlers[verb](queue, graph_id, op)
+            finally:
+                PROVENANCE_TS.reset(token)
             counts[verb] = counts.get(verb, 0) + 1
         if len(pending_nodes) + len(pending_edges) >= batch:
             await flush()

@@ -36,6 +36,14 @@ async def graph_task(
     onto this one (graph ops stay on the queue path for telemetry/cancellation
     per D7/Thread-5 lock 5).
     """
+    # Replay provenance window (0d50b921 residual): a STATE op replayed inside the
+    # window re-stamps its node's updated_at to the op's journaled ts, not rebuild
+    # time. The reserved `updated_at` key rides the wire dict; the storage
+    # capability applies it as the column. Live writes (window unset) untouched.
+    if method == "update_node":
+        ts = PROVENANCE_TS.get()
+        if ts is not None and "properties" in kwargs:
+            kwargs = {**kwargs, "properties": {**kwargs["properties"], "updated_at": ts}}
     jid = await queue.submit(graph_id, task=GRAPH_TASK, method=method, **kwargs)
     job = await queue.wait_for_job(jid)
     if job.status != JobStatus.completed:

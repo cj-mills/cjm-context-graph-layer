@@ -30,3 +30,35 @@ def test_node_identity_mismatch():
 def test_extend_result_defaults():
     r = ExtendResult()
     assert r.nodes_added == 0 and r.added_edge_ids == []
+
+
+def test_graph_task_stamps_update_node_inside_window():
+    # 0d50b921 residual: inside the replay provenance window an update_node
+    # payload carries the reserved `updated_at` (the op's journaled ts); outside
+    # the window payloads ride untouched (live writes keep capability now()).
+    import asyncio
+    from types import SimpleNamespace
+
+    from cjm_context_graph_layer.ops import PROVENANCE_TS, graph_task
+    from cjm_substrate.core.queue import JobStatus
+
+    class FakeQueue:
+        def __init__(self):
+            self.submitted = []
+
+        async def submit(self, graph_id, **kw):
+            self.submitted.append(kw)
+            return "j1"
+
+        async def wait_for_job(self, jid):
+            return SimpleNamespace(status=JobStatus.completed, result=True, error=None)
+
+    q = FakeQueue()
+    token = PROVENANCE_TS.set(777.0)
+    try:
+        asyncio.run(graph_task(q, "g", "update_node", node_id="n1", properties={"x": 1}))
+    finally:
+        PROVENANCE_TS.reset(token)
+    asyncio.run(graph_task(q, "g", "update_node", node_id="n1", properties={"x": 2}))
+    assert q.submitted[0]["properties"] == {"x": 1, "updated_at": 777.0}
+    assert q.submitted[1]["properties"] == {"x": 2}

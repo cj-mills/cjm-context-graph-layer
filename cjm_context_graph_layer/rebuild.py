@@ -17,7 +17,7 @@ import asyncio
 import hashlib
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from cjm_context_graph_primitives.journal import journal_segments
 from cjm_substrate.core.manager import CapabilityManager

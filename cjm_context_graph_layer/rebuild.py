@@ -14,14 +14,47 @@ tool (the explicit-graph-db-path guardrail).
 
 import argparse
 import asyncio
+import hashlib
+import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_context_graph_primitives.journal import journal_segments
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 
 from .journal import composed_replay_handlers, replay_journal
+
+
+def idset_digest(
+    db_path: str,  # A graph db (the sqlite capability's schema: nodes + edges tables)
+) -> Dict[str, Any]:  # {"nodes": n, "edges": n, "nodes_md5", "edges_md5"} over the SORTED id sets
+    """The rebuild-acceptance digest (craft P-49: ID-SET MD5 EQUALITY, never counts).
+
+    Two dbs are the same projection exactly when both digests match; a compaction
+    is PROVEN when the live db (retired wires deleted) and a fresh rebuild from
+    the compacted journal digest-equal. Read-only, direct sqlite (no worker): a
+    million ids sort in seconds."""
+    uri = f"file:{db_path}?mode=ro"
+    con = sqlite3.connect(uri, uri=True)
+    try:
+        out: Dict[str, Any] = {}
+        for table in ("nodes", "edges"):
+            ids = sorted(r[0] for r in con.execute(f"SELECT id FROM {table}"))
+            h = hashlib.md5()
+            for i in ids:
+                h.update(i.encode("utf-8"))
+                h.update(b"\n")
+            out[table] = len(ids)
+            out[f"{table}_md5"] = h.hexdigest()
+        return out
+    finally:
+        con.close()
+
+
+def digests_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:  # Same node AND edge id sets
+    """True when two `idset_digest` results describe the same projection."""
+    return a.get("nodes_md5") == b.get("nodes_md5") and a.get("edges_md5") == b.get("edges_md5")
 
 
 async def rebuild_db(

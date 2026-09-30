@@ -64,6 +64,60 @@ def test_graph_task_stamps_update_node_inside_window():
     assert q.submitted[1]["properties"] == {"x": 2}
 
 
+def test_observe_writes_records_every_write_and_reads_a_delete_first():
+    # Design amendment 9ee4e346: a step that runs once per window reads the window's writes
+    # from the observer at graph_task; a delete names ids only, so its rows are read first.
+    import asyncio
+    from types import SimpleNamespace
+
+    from cjm_context_graph_layer.ops import graph_task, observe_writes
+    from cjm_context_graph_primitives.query import EdgeQueryResult, NodeQueryResult
+    from cjm_substrate.core.queue import JobStatus
+
+    doomed_node = {"id": "s1", "label": "Section", "properties": {"anchor": "setup"}}
+    doomed_edge = {"id": "e9", "source_id": "a", "target_id": "b",
+                   "relation_type": "SUPERSEDES", "properties": {}}
+
+    class FakeQueue:
+        def __init__(self):
+            self.methods = []
+
+        async def submit(self, graph_id, **kw):
+            self.methods.append(kw["method"])
+            return kw["method"]
+
+        async def wait_for_job(self, jid):
+            result = True
+            if jid == "query_nodes":
+                result = NodeQueryResult.from_dict({"nodes": [doomed_node]})
+            elif jid == "query_edges":
+                result = EdgeQueryResult.from_dict({"edges": [doomed_edge]})
+            return SimpleNamespace(status=JobStatus.completed, result=result, error=None)
+
+    q = FakeQueue()
+
+    async def go():
+        await graph_task(q, "g", "add_nodes", nodes=[{"id": "n1", "label": "Note",
+                                                       "properties": {"site_refs": ["/x/"]}}])
+        with observe_writes() as writes:
+            await graph_task(q, "g", "add_edges", edges=[{"id": "e1", "relation_type": "REFERENCES",
+                                                          "source_id": "a", "target_id": "b"}])
+            await graph_task(q, "g", "update_node", node_id="n1", properties={"site_refs": []})
+            await graph_task(q, "g", "get_node", node_id="n1")   # a read: not recorded
+            await graph_task(q, "g", "delete_nodes", node_ids=["s1"], cascade=True)
+            await graph_task(q, "g", "delete_edges", edge_ids=["e9"])
+        return writes
+
+    writes = asyncio.run(go())
+    # outside the block nothing is recorded; inside, one record per write, reads left out
+    assert [w["method"] for w in writes] == ["add_edges", "update_node", "delete_nodes", "delete_edges"]
+    assert writes[0]["edges"][0]["relation_type"] == "REFERENCES"
+    assert writes[1]["nodes"] == [{"id": "n1", "label": None, "properties": {"site_refs": []}}]
+    assert writes[2]["nodes"][0]["label"] == "Section" and writes[3]["edges"][0]["relation_type"] == "SUPERSEDES"
+    # each delete was read just before it ran
+    assert q.methods[-4:] == ["query_nodes", "delete_nodes", "query_edges", "delete_edges"]
+
+
 def test_journal_extend_stamps_adds_with_the_journaled_ts(tmp_path):
     # The op clock (design 8f6f2343): a live journal_extend opens ONE window, so the nodes
     # and edges it adds carry created_at / updated_at equal to the op ts it journals — the

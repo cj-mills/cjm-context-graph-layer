@@ -1,9 +1,9 @@
 """Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search."""
 
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from cjm_context_graph_primitives.journal import PROVENANCE_TS
 from cjm_context_graph_primitives.query import (EdgeQuery, EdgeQueryResult, NodeQuery,
                                                 NodeQueryResult)
 from cjm_substrate.core.queue import JobQueue, JobStatus
@@ -15,13 +15,13 @@ _REGISTERED_WIRE_KINDS = (NodeQueryResult, EdgeQueryResult)
 
 GRAPH_TASK = "graph-storage"  # The graph-storage adapter task (explicit task channel, stage 4)
 
-# The REPLAY PROVENANCE WINDOW (finding 0d50b921): journal replay sets this to the
-# op's journaled ts around each re-applied write, and extend_graph stamps it as
-# created_at/updated_at on the wire dicts it ADDS — so a rebuild RESTORES temporal
-# provenance instead of clamping every node/edge to rebuild time. Async-scoped
-# (ContextVar), set ONLY by replay; live writes leave it None and the storage
-# capability stamps now() as before.
-PROVENANCE_TS: ContextVar[Optional[float]] = ContextVar("provenance_ts", default=None)
+
+# The OP CLOCK window (finding 0d50b921; design 8f6f2343 moved it into primitives and
+# re-exports it here, one variable for replay and live): replay opens it at each op's
+# journaled ts, a live write opens it with ONE clock read (`op_clock`), and extend_graph /
+# graph_task stamp it as created_at / updated_at on what they add and update — so a live db
+# and its rebuild carry the same times. Outside any window the storage capability stamps
+# now() (unjournaled writes: ingest scratch, probes).
 
 
 async def graph_task(
@@ -36,11 +36,11 @@ async def graph_task(
     onto this one (graph ops stay on the queue path for telemetry/cancellation
     per D7/Thread-5 lock 5).
     """
-    # Replay provenance window (0d50b921 residual): a STATE op replayed inside the
-    # window re-stamps its node's updated_at to the op's journaled ts, not rebuild
-    # time. The reserved `updated_at` key rides the wire dict; the storage
-    # capability applies it as the column. Live writes (window unset) untouched.
-    if method == "update_node":
+    # The op clock (0d50b921 residual, design 8f6f2343): an update inside a window —
+    # replay at the op's journaled ts, or a live write unit's one clock read — stamps
+    # updated_at to that ts. The reserved `updated_at` key rides the wire dict; the
+    # storage capability applies it as the column. Outside a window: capability now().
+    if method in ("update_node", "update_edge"):
         ts = PROVENANCE_TS.get()
         if ts is not None and "properties" in kwargs:
             kwargs = {**kwargs, "properties": {**kwargs["properties"], "updated_at": ts}}
@@ -123,9 +123,9 @@ async def extend_graph(
     duplicates — its layer-0 (stress item 1).
     """
     result = ExtendResult()
-    # Replay provenance window (0d50b921): inside replay, stamp the journaled ts
-    # onto everything ADDED so a rebuild restores true creation times. setdefault
-    # keeps any explicitly-carried stamp; live writes (ts None) stay capability-stamped.
+    # The op clock (0d50b921, design 8f6f2343): inside a window — replay, or a live
+    # write unit — stamp its ts onto everything ADDED, so live and rebuild agree.
+    # setdefault keeps any explicitly-carried stamp; outside a window, capability now().
     ts = PROVENANCE_TS.get()
 
     if nodes:

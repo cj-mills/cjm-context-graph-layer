@@ -1,9 +1,9 @@
 """The domain-neutral context-graph grammar: spine relations (NEXT / PART_OF / STARTS_WITH, recurring fractally at every layer), overlay relations (SUPERSEDES / DERIVED_FROM / PRODUCED), root kinds, and the standardized attribution fields."""
 
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_context_graph_layer.identity import derive_edge_id
+from cjm_context_graph_primitives.journal import op_now
 
 
 class SpineRelations:
@@ -40,7 +40,7 @@ ROOT_KINDS = ("ingested", "asserted", "derived")
 def attribution(
     actor: str,                          # Who asserted/produced this (e.g. "human", "agent:claude", "capability:whisper")
     method: Optional[str] = None,        # How (e.g. "transcribe", "alignment-fold/v1")
-    asserted_at: Optional[float] = None, # Unix timestamp; None = now
+    asserted_at: Optional[float] = None, # Unix timestamp; None = the op clock (an open window's ts, else now)
 ) -> Dict[str, Any]:  # Standardized attribution property dict
     """Standardized attribution fields for derived/asserted nodes.
 
@@ -48,7 +48,7 @@ def attribution(
     are uniform across workflows (P13's hand-rolled Connection attribution
     graduated into the grammar).
     """
-    out: Dict[str, Any] = {"actor": actor, "asserted_at": asserted_at if asserted_at is not None else time.time()}
+    out: Dict[str, Any] = {"actor": actor, "asserted_at": asserted_at if asserted_at is not None else op_now()}
     if method is not None:
         out["method"] = method
     return out

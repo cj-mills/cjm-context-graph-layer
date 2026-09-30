@@ -11,7 +11,7 @@ discipline live in `cjm_context_graph_primitives.journal`.
 from importlib.metadata import entry_points
 from typing import Any, Callable, Dict, List, Optional
 
-from cjm_context_graph_primitives.journal import append_op, read_journal
+from cjm_context_graph_primitives.journal import append_op, op_clock, read_journal
 from cjm_context_graph_primitives.query import EdgeQuery, NodeQuery
 
 from .ops import extend_graph, ExtendResult, graph_task, PROVENANCE_TS
@@ -172,7 +172,20 @@ async def journal_extend(
     added by an earlier journaled op (or the genesis baseline), so re-runs over
     cached content collide into verified no-ops AND leave the journal untouched —
     the Derivation no-spam principle applied to the write journal. Appends ride
-    the bulk lane (fresh deterministic ids collide at REPLAY, not append time)."""
+    the bulk lane (fresh deterministic ids collide at REPLAY, not append time).
+    One op clock window spans the extend and the append (design 8f6f2343): what the
+    extend adds carries the op's ts, exactly as its replay will stamp it."""
+    with op_clock():
+        return await _journal_extend(queue, graph_id, nodes, edges, journal_path,
+                                     verb, actor, run, args)
+
+
+async def _journal_extend(
+    queue: Any, graph_id: str, nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]],
+    journal_path: Optional[str], verb: str, actor: str, run: Optional[str],
+    args: Optional[Dict[str, Any]],
+) -> ExtendResult:  # The extend result (adds + verified counts)
+    """`journal_extend`'s body, run inside its op clock window."""
     res = await extend_graph(queue, graph_id, nodes, edges)
     if journal_path and (res.nodes_added or res.edges_added):
         added_n = set(res.added_node_ids)

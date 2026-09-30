@@ -62,3 +62,36 @@ def test_graph_task_stamps_update_node_inside_window():
     asyncio.run(graph_task(q, "g", "update_node", node_id="n1", properties={"x": 2}))
     assert q.submitted[0]["properties"] == {"x": 1, "updated_at": 777.0}
     assert q.submitted[1]["properties"] == {"x": 2}
+
+
+def test_journal_extend_stamps_adds_with_the_journaled_ts(tmp_path):
+    # The op clock (design 8f6f2343): a live journal_extend opens ONE window, so the nodes
+    # and edges it adds carry created_at / updated_at equal to the op ts it journals — the
+    # value replay stamps on the same wires.
+    import asyncio
+    from types import SimpleNamespace
+
+    from cjm_context_graph_layer.journal import journal_extend
+    from cjm_context_graph_primitives.journal import read_journal
+    from cjm_substrate.core.queue import JobStatus
+
+    class FakeQueue:
+        def __init__(self):
+            self.submitted = []
+
+        async def submit(self, graph_id, **kw):
+            self.submitted.append(kw)
+            return "j1"
+
+        async def wait_for_job(self, jid):  # presence queries find nothing; adds succeed
+            result = (SimpleNamespace(nodes=[], edges=[])
+                      if self.submitted[-1]["method"] == "query_nodes" else ["n1"])
+            return SimpleNamespace(status=JobStatus.completed, result=result, error=None)
+
+    q = FakeQueue()
+    j = str(tmp_path / "w.jsonl")
+    asyncio.run(journal_extend(q, "g", [{"id": "n1", "label": "Seg", "properties": {}}], [],
+                               journal_path=j, verb="graph-extend", actor="test"))
+    ts = read_journal(j)[0]["ts"]
+    added = next(kw for kw in q.submitted if kw["method"] == "add_nodes")
+    assert [(n["created_at"], n["updated_at"]) for n in added["nodes"]] == [(ts, ts)]

@@ -6,15 +6,27 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 
 ## Modules
 
+- **`cjm_context_graph_layer.__init__`**
+- **`cjm_context_graph_layer.compact`** — Journal COMPACTION — move retired wires out of the active journal family into an archive (ruling a7617bd4).
 - **`cjm_context_graph_layer.declare`** — Provenance-by-declaration: host logic stays readable Python in the workflow core and DECLARES its provenance contributions as a Derivation event node (+ DERIVED_FROM input edges, PRODUCED output edges). This recovers audit completeness without the substrate executing host logic (pass-2 Thread 4's false-dichotomy resolution). The substrate stays untouched: declarations read composition/job ids from the outside.
 - **`cjm_context_graph_layer.edits`** — The spine-edit operation vocabulary (prune / replace_text / boundary_shift) + supersession resolution + the effective-view projection. These are generic operations on any NEXT-chained text spine; correction workflows carry them in overlay-node payloads, and the projection interprets them at read time (migrates correction-core C11/C16 onto the layer).
 - **`cjm_context_graph_layer.grammar`** — The domain-neutral context-graph grammar: spine relations (NEXT / PART_OF / STARTS_WITH, recurring fractally at every layer), overlay relations (SUPERSEDES / DERIVED_FROM / PRODUCED), root kinds, and the standardized attribution fields.
 - **`cjm_context_graph_layer.identity`** — Deterministic node/edge identity: UUIDv5 over canonical identity tuples (stage-5 ratified rule: a node's id derives from what makes it THE same node across re-derivation, never from its correctable content).
 - **`cjm_context_graph_layer.journal`** — Journal replay for workflow graphs — the genesis baseline + the pluggable verb registry.
 - **`cjm_context_graph_layer.ops`** — Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search.
-- **`cjm_context_graph_layer.rebuild`**
+- **`cjm_context_graph_layer.rebuild`** — Rebuild a workflow graph db from its journal — the runnable disaster-recovery driver.
 
 ## API
+
+### `cjm_context_graph_layer.compact`
+
+- `CompactRefusal` _class_ — Compaction refused before writing: a kept op still references a retired id
+- `CompactReport` _class_ — What a compaction did (or, dry-run, would do).
+- `DanglingRef` _class_ — One kept op that names a retired id — the reason a compaction refuses.
+- `archive_segments` _function_ — The archive family beside a journal: `<stem>.retired.NNNN.jsonl` under `archive_dir`.
+- `compact_journal` _function_ — Move every wire on the retired ids out of the journal family into ONE new archive segment.
+- `next_archive_path` _function_
+- `scan_references` _function_ — The post-compaction static check: the family names none of the retired ids.
 
 ### `cjm_context_graph_layer.declare`
 
@@ -61,14 +73,17 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `extend_graph` _function_ — Idempotently extend the graph: emit-if-absent + verify-if-present.
 - `graph_task` _function_ — Invoke a graph-storage adapter method through the queue's task channel.
 - `node_identity_mismatch` _function_ — Verify-if-present check: label + sources content-hash set must match.
+- `observe_writes` _function_ — Collect every storage write made inside the block, one record per write:
 - `partition_by_presence` _function_ — Split wire dicts into absent (to add) and present (to verify).
 
 ### `cjm_context_graph_layer.rebuild`
 
+- `digests_equal` _function_ — True when two `idset_digest` results describe the same projection.
+- `idset_digest` _function_ — The rebuild-acceptance digest (craft P-49: ID-SET MD5 EQUALITY, never counts).
 - `main` _function_ — The `cjm-workflow-rebuild` console entrypoint — one command, fresh db from journal.
 - `rebuild_db` _function_ — Rebuild `db_path` from the journal — substrate standup + composed replay.
 
 ## Dependencies
 
 **Depends on:** `cjm-context-graph-primitives`, `cjm-substrate`
-**Used by:** `cjm-context-graph-projection`, `cjm-dev-graph-schema`, `cjm-markdown-decompose-core`, `cjm-notebook-decompose-core`, `cjm-transcript-correction-core`, `cjm-transcript-correction-tui`, `cjm-transcript-decomp-core`, `cjm-transcript-graph-schema`, `cjm-transcription-core`
+**Used by:** `cjm-context-graph-projection`, `cjm-dev-graph-schema`, `cjm-markdown-decompose-core`, `cjm-notebook-decompose-core`, `cjm-session-scratchpad-qt`, `cjm-transcript-correction-core`, `cjm-transcript-correction-qt`, `cjm-transcript-decomp-core`, `cjm-transcript-graph-schema`, `cjm-transcription-core`, `cjm-workflow-hub-qt`

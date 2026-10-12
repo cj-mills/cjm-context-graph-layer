@@ -29,6 +29,7 @@ module owns the journal-file discipline only — it never touches a db.
 """
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -37,7 +38,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from cjm_context_graph_primitives.journal import journal_segments, rotate_journal
+from cjm_context_graph_primitives.journal import (journal_segments, read_segment, rotate_journal,
+                                                  write_segment)
 
 from .journal import GENESIS_EDGE, GENESIS_NODE
 
@@ -214,7 +216,7 @@ def compact_journal(
         report.bytes_before += st.st_size
         kept: List[str] = []
         changed = False
-        with open(seg, "r", encoding="utf-8", newline="") as fh:
+        with io.StringIO(read_segment(seg), newline="") as fh:  # plain or compressed (f1173d0b)
             for lineno, raw in enumerate(fh, start=1):
                 if not raw.strip():
                     kept.append(raw)
@@ -305,12 +307,7 @@ def compact_journal(
             raise CompactRefusal(f"segment {seg} changed underfoot during compaction {label!r} "
                                  f"(archive {archive_path} already written; the rewrite of THIS "
                                  f"segment was skipped — re-run: replay stays idempotent)")
-        tmp = seg + ".compact-tmp"
-        with open(tmp, "w", encoding="utf-8", newline="") as out:
-            out.writelines(kept)
-            out.flush()
-            os.fsync(out.fileno())
-        os.replace(tmp, seg)
+        write_segment(seg, "".join(kept))  # atomic, in the segment's own encoding (a compressed one stays compressed)
     return report
 
 
@@ -322,7 +319,7 @@ def scan_references(
     retired = {str(i) for i in retired_ids}
     out: List[DanglingRef] = []
     for seg in journal_segments(journal_path):
-        with open(seg, "r", encoding="utf-8", newline="") as fh:
+        with io.StringIO(read_segment(seg), newline="") as fh:  # plain or compressed (f1173d0b)
             for lineno, raw in enumerate(fh, start=1):
                 if not raw.strip():
                     continue

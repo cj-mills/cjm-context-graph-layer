@@ -12,7 +12,7 @@ from cjm_context_graph_layer.compact import (CompactRefusal, archive_segments, c
                                              next_archive_path, scan_references)
 from cjm_context_graph_layer.journal import GENESIS_EDGE, GENESIS_NODE
 from cjm_context_graph_layer.rebuild import digests_equal, idset_digest
-from cjm_context_graph_primitives.journal import journal_segments, read_journal
+from cjm_context_graph_primitives.journal import journal_segments, read_journal, read_segment
 
 R1 = "11111111-1111-4111-8111-111111111111"   # retired segment
 R2 = "22222222-2222-4222-8222-222222222222"   # retired segment
@@ -111,7 +111,7 @@ def test_live_tail_is_rotated_never_rewritten(tmp_path):
     # invariant 3: the tail was closed into a cold segment first; its bytes are intact there
     assert not Path(jp).exists()
     segs = journal_segments(jp)
-    assert Path(segs[-1]).read_text() == tail_text
+    assert read_segment(segs[-1]) == tail_text  # stored compressed, byte-identical (f1173d0b)
     assert rep.segments_scanned == 3
 
 

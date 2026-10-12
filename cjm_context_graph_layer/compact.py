@@ -55,6 +55,7 @@ class CompactRefusal(RuntimeError):
 @dataclass
 class DanglingRef:
     """One kept op that names a retired id — the reason a compaction refuses."""
+
     segment: str          # Cold segment path the op lives in
     line: int             # 1-based line number within that segment
     verb: str             # The op's verb
@@ -64,6 +65,7 @@ class DanglingRef:
 @dataclass
 class CompactReport:
     """What a compaction did (or, dry-run, would do)."""
+
     label: str
     dry_run: bool
     journal_path: str

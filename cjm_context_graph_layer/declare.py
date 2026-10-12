@@ -17,6 +17,7 @@ class Derivation:
     node's SourceRefs — duplicating it here would re-create topology, the
     Thread-2 no-derived_from rule).
     """
+
     actor: str                       # Who ran it (e.g. "host:cjm-transcript-decomp-core")
     method: str                      # The transformation (e.g. "alignment-fold/v1")
     input_ids: List[str] = field(default_factory=list)   # Graph node ids consumed

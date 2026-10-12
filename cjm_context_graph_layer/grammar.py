@@ -9,6 +9,7 @@ from cjm_context_graph_primitives.journal import op_now
 class SpineRelations:
     """Structural spine relations, reused fractally at every layer
     (Source -> AudioSegment -> Segment today; series -> episode tomorrow)."""
+
     NEXT = "NEXT"               # Sequential order among siblings
     PART_OF = "PART_OF"         # Containment (child -> parent)
     STARTS_WITH = "STARTS_WITH" # Entry point (parent -> first child)
@@ -22,6 +23,7 @@ class SpineRelations:
 class OverlayRelations:
     """Overlay/derivation relations — the trust grammar shared by every
     workflow's graph extensions."""
+
     SUPERSEDES = "SUPERSEDES"     # Newer overlay node -> the prior one it replaces (append-only undo)
     DERIVED_FROM = "DERIVED_FROM" # Derived/overlay node -> the node(s) it derives from / consumed
     PRODUCED = "PRODUCED"         # Derivation event -> the node(s) it produced

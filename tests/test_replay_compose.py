@@ -8,6 +8,7 @@ from cjm_context_graph_layer.journal import apply_wires, composed_replay_handler
 
 class _FakeEp:
     """A minimal importlib.metadata.EntryPoint stand-in: (name, factory)."""
+
     def __init__(self, name, factory):
         self.name = name
         self._factory = factory

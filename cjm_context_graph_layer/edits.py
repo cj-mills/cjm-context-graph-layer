@@ -12,12 +12,14 @@ EDIT_OPS = ("prune", "replace_text", "boundary_shift")
 
 class SpineEditError(ValueError):
     """A spine edit could not be validated or applied (loud, never silent)."""
+
     pass
 
 
 @dataclass
 class SpineUnit:
     """Minimal projection unit: one spine position with its effective text."""
+
     id: str    # Layer-0 segment node id
     text: str  # Effective text at this position
 
@@ -39,6 +41,7 @@ class SpineEdit:
       pure concat-invariance). Word-stream 1:1 alignment is maintained — count
       and positions never change.
     """
+
     edit_id: str                                  # Carrying overlay node id (supersession anchor)
     op: str                                       # One of EDIT_OPS
     targets: List[str] = field(default_factory=list)   # Layer-0 segment node ids the edit applies to

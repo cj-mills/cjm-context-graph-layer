@@ -136,6 +136,7 @@ class GraphIntegrityError(RuntimeError):
     Raised by verify-if-present: same deterministic id but mismatched label or
     provenance content hashes means the identity tuple and the content have
     diverged — never overwrite silently."""
+
     pass
 
 
@@ -177,6 +178,7 @@ def partition_by_presence(
 @dataclass
 class ExtendResult:
     """Outcome of one idempotent extend_graph commit."""
+
     nodes_added: int = 0      # Nodes newly created
     nodes_verified: int = 0   # Nodes already present, identity-verified
     edges_added: int = 0      # Edges newly created

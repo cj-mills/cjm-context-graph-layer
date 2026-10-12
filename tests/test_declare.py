@@ -1,6 +1,7 @@
 """Tests for cjm_context_graph_layer.declare — provenance-by-declaration.
 
 Projected from the declare notebook's test cell at the c25780e8 flip."""
+
 from cjm_context_graph_layer.declare import Derivation, derivation_to_graph
 
 

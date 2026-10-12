@@ -2,8 +2,8 @@
 
 Projected from the ops notebook's test cell at the c25780e8 flip (the async
 extend_graph path is exercised live by the cores' loop-back harnesses)."""
-from cjm_context_graph_layer.ops import (ExtendResult, node_identity_mismatch,
-                                         partition_by_presence)
+
+from cjm_context_graph_layer.ops import ExtendResult, node_identity_mismatch, partition_by_presence
 
 
 def test_partition_by_presence():

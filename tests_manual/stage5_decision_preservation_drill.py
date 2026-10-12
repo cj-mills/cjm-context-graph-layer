@@ -17,20 +17,21 @@ rebuilt Source-rooted corpus:
 
 Run from cjm-transcript-correction-core repo root in its env.
 """
+
 import asyncio
 import json
 import sys
 from pathlib import Path
 
+from cjm_context_graph_layer.grammar import make_edge, OverlayRelations
+from cjm_context_graph_layer.ops import extend_graph, graph_task
+from cjm_context_graph_primitives.graph import GraphNode
+from cjm_context_graph_primitives.locators import GraphNodeRef
+from cjm_context_graph_primitives.provenance import SourceRef
+from cjm_context_graph_primitives.query import NodeQuery, SourcePredicate
+from cjm_context_graph_primitives.slices import FullContent
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
-from cjm_context_graph_primitives.provenance import SourceRef
-from cjm_context_graph_primitives.locators import GraphNodeRef
-from cjm_context_graph_primitives.slices import FullContent
-from cjm_context_graph_primitives.query import NodeQuery, SourcePredicate
-from cjm_context_graph_primitives.graph import GraphNode
-from cjm_context_graph_layer.ops import graph_task, extend_graph
-from cjm_context_graph_layer.grammar import OverlayRelations, make_edge
 
 CORPUS = "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-transcript-decomp-core/.cjm/data/cjm-graph-plugin-sqlite/context_graph.db"
 GRAPH_ID = "cjm-graph-plugin-sqlite"

@@ -1,10 +1,10 @@
 """Tests for cjm_context_graph_layer.edits — spine-edit vocabulary + projection.
 
 Projected from the edits notebook's three test cells at the c25780e8 flip."""
-import pytest
 
-from cjm_context_graph_layer.edits import (SpineEdit, SpineEditError, SpineUnit,
-                                           project_effective_spine, resolve_active)
+import pytest
+from cjm_context_graph_layer.edits import (project_effective_spine, resolve_active, SpineEdit,
+                                           SpineEditError, SpineUnit)
 
 
 def test_vocabulary_and_supersession():

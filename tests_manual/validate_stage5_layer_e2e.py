@@ -27,6 +27,7 @@ correction-core repo root), in an env with the layer + schema libs:
 
 Part B uses a SCRATCH graph DB (synthetic spine); the corpus is never touched.
 """
+
 import argparse
 import asyncio
 import random
@@ -37,12 +38,14 @@ from pathlib import Path
 from typing import Any, Dict, List
 from uuid import uuid4
 
+from cjm_context_graph_layer.edits import (project_effective_spine, resolve_active, SpineEdit,
+                                           SpineUnit)
+from cjm_context_graph_layer.grammar import (grouped_spine_edges, make_edge, OverlayRelations,
+                                             spine_edges)
+from cjm_context_graph_layer.ops import extend_graph, graph_task
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
-from cjm_context_graph_layer.ops import graph_task, extend_graph
-from cjm_context_graph_layer.grammar import OverlayRelations, make_edge, spine_edges, grouped_spine_edges
-from cjm_context_graph_layer.edits import SpineEdit, SpineUnit, resolve_active, project_effective_spine
-from cjm_transcript_graph_schema.schema import SourceNode, AudioSegmentNode, SegmentNode
+from cjm_transcript_graph_schema.schema import AudioSegmentNode, SegmentNode, SourceNode
 
 GRAPH_ID = "cjm-graph-plugin-sqlite"
 

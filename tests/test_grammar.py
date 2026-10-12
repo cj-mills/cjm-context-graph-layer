@@ -1,9 +1,10 @@
 """Tests for cjm_context_graph_layer.grammar — relations, attribution, edge builders.
 
 Projected from the grammar notebook's two test cells at the c25780e8 flip."""
-from cjm_context_graph_layer.grammar import (ROOT_KINDS, OverlayRelations, SpineRelations,
-                                             attribution, grouped_spine_edges, make_edge,
-                                             spine_edges)
+
+from cjm_context_graph_layer.grammar import (attribution, grouped_spine_edges, make_edge,
+                                             OverlayRelations, ROOT_KINDS, spine_edges,
+                                             SpineRelations)
 
 
 def test_spine_edge_builders():

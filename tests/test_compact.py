@@ -7,8 +7,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-
-from cjm_context_graph_layer.compact import (CompactRefusal, archive_segments, compact_journal,
+from cjm_context_graph_layer.compact import (archive_segments, compact_journal, CompactRefusal,
                                              next_archive_path, scan_references)
 from cjm_context_graph_layer.journal import GENESIS_EDGE, GENESIS_NODE
 from cjm_context_graph_layer.rebuild import digests_equal, idset_digest

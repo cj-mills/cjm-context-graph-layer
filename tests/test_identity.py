@@ -1,10 +1,10 @@
 """Tests for cjm_context_graph_layer.identity — deterministic UUIDv5 identity.
 
 Projected from the identity notebook's test cell at the c25780e8 flip."""
+
 import uuid
 
 import pytest
-
 from cjm_context_graph_layer.identity import canonical_part, derive_edge_id, derive_node_id
 
 

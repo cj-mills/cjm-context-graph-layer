@@ -1,8 +1,7 @@
 """composed_replay_handlers: entry-point union, collision policy, loud refusal (DEC 426658f1)."""
 
-import pytest
-
 import cjm_context_graph_layer.journal as journal_mod
+import pytest
 from cjm_context_graph_layer.journal import apply_wires, composed_replay_handlers, wires_handlers
 
 

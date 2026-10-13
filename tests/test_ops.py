@@ -149,3 +149,64 @@ def test_journal_extend_stamps_adds_with_the_journaled_ts(tmp_path):
     ts = read_journal(j)[0]["ts"]
     added = next(kw for kw in q.submitted if kw["method"] == "add_nodes")
     assert [(n["created_at"], n["updated_at"]) for n in added["nodes"]] == [(ts, ts)]
+
+
+def test_graph_task_folds_each_call_into_the_armed_run():
+    # The instrument (design detail 681604c1): the one storage door records every call by
+    # method -- rows each way, the proxy's measurements off the job, and whole scope under the
+    # phase it ran in; with no run armed it records nothing.
+    import asyncio
+    from types import SimpleNamespace
+
+    from cjm_context_graph_layer.ops import graph_task
+    from cjm_context_graph_primitives.query import NodeQuery, NodeQueryResult, OrderBy
+    from cjm_context_graph_primitives.timings import begin_run, end_run, span
+    from cjm_substrate.core.queue import JobStatus
+
+    class FakeQueue:
+        async def submit(self, graph_id, **kw):
+            return "j1"
+
+        async def wait_for_job(self, jid):
+            return SimpleNamespace(status=JobStatus.completed, error=None,
+                                   result=NodeQueryResult(nodes=[], rows=[{"id": "a"}, {"id": "b"}]),
+                                   metrics={"bytes_in": 40, "worker_s": 0.01})
+
+    q = FakeQueue()
+    asyncio.run(graph_task(q, "g", "query_nodes", query=NodeQuery(label="X").to_dict()))  # unarmed
+    run = begin_run("cli", "t")
+    try:
+        async def calls():
+            with span("verb"):
+                await graph_task(q, "g", "query_nodes", query=NodeQuery(label="X").to_dict())
+                await graph_task(q, "g", "query_nodes", query=NodeQuery(ids=["a", "b"]).to_dict())
+                await graph_task(q, "g", "query_nodes", query=NodeQuery(label="X", count=True).to_dict())
+        asyncio.run(calls())
+    finally:
+        end_run(run)
+    row = run.storage["query_nodes"]
+    assert row["calls"] == 3 and row["rows_in"] == 2 and row["rows_out"] == 6
+    assert row["bytes_in"] == 120 and abs(row["worker_s"] - 0.03) < 1e-9
+    assert list(run.whole) == ["verb :: query_nodes"] and run.whole["verb :: query_nodes"]["calls"] == 1
+    assert "at_limit" not in row and "paged" not in row
+
+    # paging evidence: a page that came back full, and a keyset continuation
+    run = begin_run("cli", "t")
+    try:
+        asyncio.run(graph_task(q, "g", "query_nodes", query=NodeQuery(label="X", limit=2).to_dict()))
+        asyncio.run(graph_task(q, "g", "query_nodes",
+                               query=NodeQuery(label="X", limit=2, after="b").to_dict()))
+    finally:
+        end_run(run)
+    assert run.storage["query_nodes"]["at_limit"] == 2 and run.storage["query_nodes"]["paged"] == 1
+
+    # an ordered window and an existence probe are never a cut answer
+    run = begin_run("cli", "t")
+    try:
+        asyncio.run(graph_task(q, "g", "query_nodes",
+                               query=NodeQuery(label="X", limit=2, order_by=OrderBy("ts")).to_dict()))
+        asyncio.run(graph_task(q, "g", "query_nodes", query=NodeQuery(label="X", limit=1).to_dict()))
+        asyncio.run(graph_task(q, "g", "query_nodes", query=NodeQuery(ids=["a", "b"], limit=2).to_dict()))
+    finally:
+        end_run(run)
+    assert "at_limit" not in run.storage["query_nodes"]

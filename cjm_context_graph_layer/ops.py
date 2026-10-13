@@ -1,5 +1,6 @@
 """Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search."""
 
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -8,6 +9,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from cjm_context_graph_primitives.journal import PROVENANCE_TS
 from cjm_context_graph_primitives.query import (EdgeQuery, EdgeQueryResult, NodeQuery,
                                                 NodeQueryResult)
+from cjm_context_graph_primitives.timings import CURRENT_RUN, record_storage
 from cjm_substrate.core.queue import JobQueue, JobStatus
 
 # Importing the typed query/result classes IS the host-side wire registration
@@ -67,6 +69,84 @@ def _edge_row(e: Any) -> Dict[str, Any]:  # {id, relation_type, properties} of a
             "properties": d.get("properties") or {}}
 
 
+def _whole_scope(
+    method: str,              # The storage method
+    kwargs: Dict[str, Any],   # Its kwargs
+) -> bool:  # True when the call reads a whole kind or the whole graph
+    """Whether a storage call is WHOLE-SCOPE: a typed query, or an export filter, naming no ids,
+    endpoints or predicate -- its cost is O(kind) or O(graph), whatever it returns. A count
+    reads no rows and is never whole; a keyset page of a whole pass is (each page counts)."""
+    if method == "find_nodes_by_label":
+        return True
+    if method == "export_graph":
+        q = kwargs.get("filter_query")
+    elif method in ("query_nodes", "query_edges"):
+        q = kwargs.get("query")
+    else:
+        return False
+    if q is None:
+        return True
+    q = _wire(q)
+    scoping = ("ids", "source", "related", "where", "source_id", "target_id", "source_ids",
+               "target_ids", "source_related", "target_related")
+    return not q.get("count") and not any(q.get(k) for k in scoping)
+
+
+def _rows_in(
+    method: str,              # The storage method
+    kwargs: Dict[str, Any],   # Its kwargs
+) -> int:  # Elements the call carries in: written, or named by id
+    """The rows a storage call sends: the elements it writes, else the ids it names."""
+    if method == "import_graph":
+        data = _wire(kwargs.get("graph_data") or {})
+        return len(data.get("nodes") or []) + len(data.get("edges") or [])
+    for key in ("nodes", "edges", "node_ids", "edge_ids"):
+        if kwargs.get(key):
+            return len(kwargs[key])
+    q = kwargs.get("query")
+    if q is not None and _wire(q).get("ids"):
+        return len(_wire(q)["ids"])
+    return 1 if method in ("update_node", "update_edge", "get_node", "get_edge") else 0
+
+
+def _rows_out(
+    result: Any,  # A storage call's (wire-decoded) result
+) -> int:  # The elements / rows it returned
+    """The rows a storage call returned: a list's length, else its nodes + edges + rows."""
+    if isinstance(result, list):
+        return len(result)
+    n = 0
+    for attr in ("nodes", "edges", "rows"):
+        v = result.get(attr) if isinstance(result, dict) else getattr(result, attr, None)
+        if isinstance(v, list):
+            n += len(v)
+    return n
+
+
+def _page_counters(
+    method: str,              # The storage method
+    kwargs: Dict[str, Any],   # Its kwargs
+    rows_out: int,            # The rows it returned
+) -> Dict[str, bool]:  # {"at_limit": ..., "paged": ...}, the keys only when true
+    """A typed read's paging evidence: `at_limit` when an UNORDERED read returned exactly its
+    limit (above 1) -- an arbitrary subset may have been cut; an ordered top-N is a window by
+    design, a limit of 1 an existence probe -- and `paged` when it continued a keyset pass. A
+    run whose at_limit calls outnumber its paged ones cut an answer it never continued -- the
+    silent-cap guard (finding a107e2f3)."""
+    q = kwargs.get("query") if method in ("query_nodes", "query_edges") else None
+    if q is None:
+        return {}
+    q = _wire(q)
+    out = {}
+    limit = q.get("limit") or 0
+    ids = q.get("ids") or []
+    if limit > 1 and rows_out == limit and not q.get("order_by") and (not ids or limit < len(ids)):
+        out["at_limit"] = True  # a batch by id is bounded by its ids, never an arbitrary cut
+    if q.get("after"):
+        out["paged"] = True
+    return out
+
+
 async def _observed(
     queue: JobQueue,                # Started job queue
     graph_id: str,                  # Graph-storage capability instance id
@@ -123,10 +203,20 @@ async def graph_task(
     writes = WRITE_OBSERVER.get()
     if writes is not None and method in WRITE_METHODS:
         writes.append(await _observed(queue, graph_id, method, kwargs))
+    t = time.perf_counter()
     jid = await queue.submit(graph_id, task=GRAPH_TASK, method=method, **kwargs)
     job = await queue.wait_for_job(jid)
     if job.status != JobStatus.completed:
         raise RuntimeError(f"{graph_id} {method} {job.status}: {job.error}")
+    if CURRENT_RUN.get() is not None:
+        # The instrument (design detail 681604c1): the one storage door folds every call into
+        # the armed run -- seconds submit to result, rows each way, whole scope, and what the
+        # proxy measured on the job (wire bytes, the worker's own seconds, post / decode).
+        rows_out = _rows_out(job.result)
+        record_storage(method, time.perf_counter() - t, whole=_whole_scope(method, kwargs),
+                       rows_in=_rows_in(method, kwargs), rows_out=rows_out,
+                       **_page_counters(method, kwargs, rows_out),
+                       **(getattr(job, "metrics", None) or {}))
     return job.result
 
 

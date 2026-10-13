@@ -8,11 +8,13 @@ own verb handlers on replay (replay stays DOMAIN-OWNED); the op envelope + appen
 discipline live in `cjm_context_graph_primitives.journal`.
 """
 
+import time
 from importlib.metadata import entry_points
 from typing import Any, Callable, Dict, List, Optional
 
 from cjm_context_graph_primitives.journal import append_op, op_clock, read_journal
 from cjm_context_graph_primitives.query import EdgeQuery, NodeQuery
+from cjm_context_graph_primitives.timings import record_series, span, timed
 
 from .ops import extend_graph, ExtendResult, graph_task, PROVENANCE_TS, stamp_op_time
 
@@ -53,6 +55,7 @@ async def genesis_export(
     return {"nodes": len(nodes), "edges": len(edges)}
 
 
+@timed("replay_journal")
 async def replay_journal(
     queue: Any,         # Started job queue
     graph_id: str,      # Graph-storage capability id
@@ -79,7 +82,8 @@ async def replay_journal(
 
     async def flush() -> None:
         if pending_nodes or pending_edges:
-            r = await extend_graph(queue, graph_id, list(pending_nodes), list(pending_edges))
+            with span("genesis_flush"):
+                r = await extend_graph(queue, graph_id, list(pending_nodes), list(pending_edges))
             counts["nodes_added"] += r.nodes_added
             counts["nodes_verified"] += r.nodes_verified
             counts["edges_added"] += r.edges_added
@@ -87,7 +91,7 @@ async def replay_journal(
             pending_nodes.clear()
             pending_edges.clear()
 
-    for op in read_journal(journal_path):
+    for position, op in enumerate(read_journal(journal_path)):
         verb = op.get("verb", "")
         if verb in (GENESIS_NODE, GENESIS_EDGE):
             # Replay provenance (0d50b921): stamp the op's journaled ts onto what it
@@ -107,10 +111,14 @@ async def replay_journal(
             # Domain handlers run inside the replay provenance window: whatever
             # they mint through extend_graph / update_node re-stamps to op ts.
             token = PROVENANCE_TS.set(op.get("ts"))
+            t = time.perf_counter()
             try:
                 await handlers[verb](queue, graph_id, op)
             finally:
                 PROVENANCE_TS.reset(token)
+            # The instrument (681604c1): a verb's cost against its journal position -- flat
+            # when healthy, rising when an op's cost grows with the history before it
+            record_series(f"replay:{verb}", position, time.perf_counter() - t)
             counts[verb] = counts.get(verb, 0) + 1
         if len(pending_nodes) + len(pending_edges) >= batch:
             await flush()

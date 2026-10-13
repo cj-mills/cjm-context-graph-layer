@@ -89,3 +89,37 @@ def test_replay_restores_temporal_provenance(tmp_path, monkeypatch):
     assert by_id["n3"]["created_at"] == 444.0 and by_id["n3"]["updated_at"] == 444.0
     assert seen == [333.0]  # the handler ran inside its op's provenance window
     assert PROVENANCE_TS.get() is None  # window reset after replay
+
+
+def test_replay_records_each_verbs_cost_by_position(tmp_path, monkeypatch):
+    # The instrument (681604c1): an armed replay keeps a series per domain verb, binned by
+    # journal position, and measures itself and its genesis flushes as phases.
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    from cjm_context_graph_layer.journal import GENESIS_NODE, replay_journal
+    from cjm_context_graph_primitives.timings import begin_run, end_run
+
+    jpath = tmp_path / "wf.writes.jsonl"
+    ops = ([{"verb": GENESIS_NODE, "ts": 1.0, "args": {"id": "n1", "label": "X", "properties": {}}}]
+           + [{"verb": "domain-op", "ts": 2.0, "args": {"i": i}} for i in range(3)])
+    jpath.write_text("".join(json.dumps(o) + "\n" for o in ops))
+
+    async def fake_extend(queue, graph_id, nodes, edges):
+        return SimpleNamespace(nodes_added=len(nodes), nodes_verified=0,
+                               edges_added=len(edges), edges_existing=0)
+    monkeypatch.setattr(journal_mod, "extend_graph", fake_extend)
+
+    async def handler(queue, graph_id, op):
+        return None
+
+    run = begin_run("cli", "replay")
+    try:
+        asyncio.run(replay_journal(None, "g", str(jpath), handlers={"domain-op": handler}))
+    finally:
+        end_run(run)
+    assert run.series["replay:domain-op"]["0"]["calls"] == 3
+    assert run.phases["replay_journal"]["calls"] == 1
+    assert run.phases["replay_journal/genesis_flush"]["calls"] == 1
+    assert run.phases["replay_journal/read_journal"]["ops"] == 4

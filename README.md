@@ -75,6 +75,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `node_identity_mismatch` _function_ — Verify-if-present check: label + sources content-hash set must match.
 - `observe_writes` _function_ — Collect every storage write made inside the block, one record per write:
 - `partition_by_presence` _function_ — Split wire dicts into absent (to add) and present (to verify).
+- `stamp_op_time` _function_ — Stamp the op clock's time onto an element about to be added — the one function live
 
 ### `cjm_context_graph_layer.rebuild`
 

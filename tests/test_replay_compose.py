@@ -60,6 +60,9 @@ def test_replay_restores_temporal_provenance(tmp_path, monkeypatch):
         {"verb": GENESIS_NODE, "ts": 222.0,
          "args": {"id": "n2", "label": "X", "properties": {}, "created_at": 5.0}},
         {"verb": "domain-op", "ts": 333.0, "args": {}},
+        # the correction core's wire shape: explicit None times (finding b562d5f7)
+        {"verb": GENESIS_NODE, "ts": 444.0,
+         "args": {"id": "n3", "label": "X", "properties": {}, "created_at": None, "updated_at": None}},
     ]
     jpath.write_text("".join(json.dumps(o) + "\n" for o in ops))
 
@@ -78,9 +81,11 @@ def test_replay_restores_temporal_provenance(tmp_path, monkeypatch):
 
     counts = asyncio.run(replay_journal(None, "g", str(jpath),
                                         handlers={"domain-op": handler}))
-    assert counts["nodes_added"] == 2 and counts["domain-op"] == 1
+    assert counts["nodes_added"] == 3 and counts["domain-op"] == 1
     by_id = {n["id"]: n for n in flushed}
     assert by_id["n1"]["created_at"] == 111.0 and by_id["n1"]["updated_at"] == 111.0
-    assert by_id["n2"]["created_at"] == 5.0  # a carried stamp wins (setdefault)
+    assert by_id["n2"]["created_at"] == 5.0  # a carried stamp wins
+    # an explicit None is absent, never a carried stamp: the op's time, as live writes stamp
+    assert by_id["n3"]["created_at"] == 444.0 and by_id["n3"]["updated_at"] == 444.0
     assert seen == [333.0]  # the handler ran inside its op's provenance window
     assert PROVENANCE_TS.get() is None  # window reset after replay

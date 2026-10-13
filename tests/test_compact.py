@@ -3,6 +3,7 @@ four invariants — no dangling reference outside the archive, kept ∪ archived
 the live tail is never rewritten, idempotent."""
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -11,7 +12,8 @@ from cjm_context_graph_layer.compact import (archive_segments, compact_journal, 
                                              next_archive_path, scan_references)
 from cjm_context_graph_layer.journal import GENESIS_EDGE, GENESIS_NODE
 from cjm_context_graph_layer.rebuild import digests_equal, idset_digest
-from cjm_context_graph_primitives.journal import journal_segments, read_journal, read_segment
+from cjm_context_graph_primitives.journal import (compress_cold_segments, journal_segments,
+                                                  read_journal, read_segment)
 
 R1 = "11111111-1111-4111-8111-111111111111"   # retired segment
 R2 = "22222222-2222-4222-8222-222222222222"   # retired segment
@@ -80,7 +82,7 @@ def test_compaction_moves_retired_wires_and_keeps_the_rest(tmp_path):
     assert not rep.dry_run and rep.archive_path and Path(rep.archive_path).exists()
     assert rep.ops_archived_whole == 1 and rep.ops_split == 1
     assert rep.nodes_archived == 2 and rep.edges_archived == 2  # NEXT(R1,R2) + DERIVED_FROM(R1,T1)
-    assert rep.retired_ids_seen == 2 and rep.bytes_freed > 0
+    assert rep.retired_ids_seen == 2 and rep.raw_bytes_freed > 0 and rep.disk_bytes_after is not None
     # invariant 2: kept ∪ archived == original (wire multiset)
     after = read_journal(jp)
     archived = read_journal(rep.archive_path)
@@ -150,6 +152,28 @@ def test_dry_run_touches_nothing(tmp_path):
     assert rep.nodes_archived == 2 and rep.segments_rewritten == 2 and rep.archive_path is None
     assert {s: Path(s).read_text() for s in journal_segments(jp)} == snapshot
     assert not (tmp_path / "archive").exists()
+
+
+def test_report_measures_raw_and_disk_bytes_apart_on_a_compressed_family(tmp_path):
+    # Finding 822bbba2: a compressed cold segment's st_size is its xz size while the kept text
+    # is raw, so one mixed figure read negative. Raw and on-disk bytes are separate measures,
+    # each from its own source; a dry run recompresses nothing, so its on-disk after is
+    # unmeasured (None), never guessed.
+    jp = _family(tmp_path)
+    compress_cold_segments(jp)
+    cold = [s for s in journal_segments(jp) if s != jp]
+    assert cold and all(s.endswith(".xz") for s in cold)
+    dry = compact_journal(jp, str(tmp_path / "archive"), [R1, R2], label="t", dry_run=True)
+    assert dry.raw_bytes_freed > 0 and dry.disk_bytes_after is None and dry.disk_bytes_freed is None
+    assert dry.disk_bytes_before == sum(os.path.getsize(s) for s in cold) + os.path.getsize(jp)
+    rep = compact_journal(jp, str(tmp_path / "archive"), [R1, R2], label="t")
+    cold = [s for s in journal_segments(jp) if s != jp]
+    assert rep.disk_bytes_after == sum(os.path.getsize(s) for s in cold)
+    assert rep.raw_bytes_after == sum(len(read_segment(s).encode("utf-8")) for s in cold)
+    assert rep.raw_bytes_freed > 0 and rep.rewrite_seconds > 0
+    manifest = json.loads(Path(rep.manifest_path).read_text())
+    assert manifest["disk_bytes_after"] == rep.disk_bytes_after
+    assert manifest["raw_bytes_before"] == rep.raw_bytes_before
 
 
 def test_idset_digest_equality_is_id_set_equality(tmp_path):

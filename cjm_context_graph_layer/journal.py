@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 from cjm_context_graph_primitives.journal import append_op, op_clock, read_journal
 from cjm_context_graph_primitives.query import EdgeQuery, NodeQuery
 
-from .ops import extend_graph, ExtendResult, graph_task, PROVENANCE_TS
+from .ops import extend_graph, ExtendResult, graph_task, PROVENANCE_TS, stamp_op_time
 
 GENESIS_NODE = "genesis-node"  # One node's whole-db baseline op (args = the node wire dict)
 GENESIS_EDGE = "genesis-edge"  # One edge's whole-db baseline op (args = the edge wire dict)
@@ -92,12 +92,10 @@ async def replay_journal(
         if verb in (GENESIS_NODE, GENESIS_EDGE):
             # Replay provenance (0d50b921): stamp the op's journaled ts onto what it
             # adds — per-op HERE, not via the PROVENANCE_TS window, because a flush
-            # batch spans many ops' timestamps. setdefault keeps carried stamps;
+            # batch spans many ops' timestamps. A carried stamp is kept, an explicit None
+            # is absent (`stamp_op_time`, the function live writes share — b562d5f7);
             # pre-ts journal records stay capability now()-stamped.
-            args = op["args"]
-            if op.get("ts") is not None:
-                args.setdefault("created_at", op["ts"])
-                args.setdefault("updated_at", op["ts"])
+            args = stamp_op_time(op["args"], op.get("ts"))
             (pending_nodes if verb == GENESIS_NODE else pending_edges).append(args)
         else:
             await flush()

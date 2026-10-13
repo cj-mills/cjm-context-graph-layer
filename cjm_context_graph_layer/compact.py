@@ -78,22 +78,37 @@ class CompactReport:
     ops_split: int = 0                          # Mixed ops partitioned kept/archived
     nodes_archived: int = 0
     edges_archived: int = 0
-    bytes_before: int = 0
-    bytes_after: int = 0
+    raw_bytes_before: int = 0                   # The family's text before (a compressed segment decompressed)
+    raw_bytes_after: int = 0                    # Its text after -- what a replay reads
+    disk_bytes_before: int = 0                  # On-disk bytes before (st_size: a .xz segment as stored)
+    disk_bytes_after: Optional[int] = None      # On-disk bytes after, measured at the write (None: nothing written, a dry run)
+    scan_seconds: float = 0.0                   # Reading + classifying every segment
+    rewrite_seconds: float = 0.0                # The archive + segment rewrites (a compressed one recompressed)
     retired_ids_requested: int = 0
     retired_ids_seen: int = 0                   # Requested ids that appeared as wire nodes somewhere in the family
     dangling: List[DanglingRef] = field(default_factory=list)  # Non-empty ONLY on a dry run (a live run refuses)
 
+    # Raw and on-disk bytes are separate measures (finding 822bbba2): since the cold segments
+    # went xz, st_size is the COMPRESSED size while a rewrite's kept text is raw, so one figure
+    # mixing the two reported negative bytes freed.
     @property
-    def bytes_freed(self) -> int:
-        return self.bytes_before - self.bytes_after
+    def raw_bytes_freed(self) -> int:
+        return self.raw_bytes_before - self.raw_bytes_after
+
+    @property
+    def disk_bytes_freed(self) -> Optional[int]:
+        return None if self.disk_bytes_after is None else self.disk_bytes_before - self.disk_bytes_after
 
     def summary(self) -> str:  # One-paragraph human summary
         head = "DRY RUN: " if self.dry_run else ""
         return (f"{head}{self.label}: {self.ops_archived_whole} op(s) moved whole + {self.ops_split} split "
                 f"({self.nodes_archived} node(s), {self.edges_archived} edge(s)) out of {self.ops_scanned} "
                 f"across {self.segments_scanned} segment(s); {self.segments_rewritten} rewritten; "
-                f"{self.bytes_freed / 1e6:.1f} MB freed of {self.bytes_before / 1e6:.1f}; "
+                f"text {self.raw_bytes_freed / 1e6:.1f} MB freed of {self.raw_bytes_before / 1e6:.1f}; "
+                + (f"on disk {self.disk_bytes_freed / 1e6:.1f} MB freed of {self.disk_bytes_before / 1e6:.1f}; "
+                   if self.disk_bytes_after is not None else
+                   f"on disk {self.disk_bytes_before / 1e6:.1f} MB before (after: measured at the write); ")
+                + f"scan {self.scan_seconds:.1f} s, rewrite {self.rewrite_seconds:.1f} s; "
                 f"retired ids seen {self.retired_ids_seen}/{self.retired_ids_requested}"
                 + (f"; archive {self.archive_path}" if self.archive_path else "")
                 + (f"; {len(self.dangling)} DANGLING reference(s) — a live run would refuse" if self.dangling else ""))
@@ -211,14 +226,17 @@ def compact_journal(
     archived_lines: List[str] = []
     rewrites: Dict[str, Tuple[List[str], Tuple[int, float]]] = {}  # seg -> (kept lines, (size, mtime) at scan)
     seen: Set[str] = set()
+    t_scan = time.perf_counter()
     for seg in segments:
         st = os.stat(seg)
         stamp = (st.st_size, st.st_mtime)
         report.segments_scanned += 1
-        report.bytes_before += st.st_size
+        text = read_segment(seg)  # plain or compressed (f1173d0b)
+        report.raw_bytes_before += len(text.encode("utf-8"))
+        report.disk_bytes_before += st.st_size
         kept: List[str] = []
         changed = False
-        with io.StringIO(read_segment(seg), newline="") as fh:  # plain or compressed (f1173d0b)
+        with io.StringIO(text, newline="") as fh:
             for lineno, raw in enumerate(fh, start=1):
                 if not raw.strip():
                     kept.append(raw)
@@ -265,10 +283,11 @@ def compact_journal(
         if changed:
             rewrites[seg] = (kept, stamp)
             report.segments_rewritten += 1
-            report.bytes_after += sum(len(x.encode("utf-8")) for x in kept)
+            report.raw_bytes_after += sum(len(x.encode("utf-8")) for x in kept)
         else:
-            report.bytes_after += st.st_size
+            report.raw_bytes_after += len(text.encode("utf-8"))
     report.retired_ids_seen = len(seen & retired)
+    report.scan_seconds = time.perf_counter() - t_scan
 
     if report.dangling and not dry_run:
         sample = "; ".join(f"{Path(d.segment).name}:{d.line} {d.verb} -> {', '.join(i[:8] for i in d.ids)}"
@@ -278,10 +297,13 @@ def compact_journal(
             f"ids (the retire gate should have caught these dependents) — {sample}"
             + (" …" if len(report.dangling) > 6 else ""))
     if dry_run or not archived_lines:
+        if not dry_run:
+            report.disk_bytes_after = report.disk_bytes_before  # nothing rewritten: measured as is
         return report
 
     # Write the archive + manifest BEFORE any segment is rewritten: a crash between the
     # two leaves duplicates (idempotent under replay), never a loss.
+    t_write = time.perf_counter()
     Path(archive_dir).mkdir(parents=True, exist_ok=True)
     archive_path = next_archive_path(journal_path, archive_dir)
     with open(archive_path, "w", encoding="utf-8", newline="") as out:
@@ -295,11 +317,15 @@ def compact_journal(
         "retired_ids_requested": report.retired_ids_requested, "retired_ids_seen": report.retired_ids_seen,
         "ops_archived_whole": report.ops_archived_whole, "ops_split": report.ops_split,
         "nodes_archived": report.nodes_archived, "edges_archived": report.edges_archived,
-        "bytes_before": report.bytes_before, "bytes_after": report.bytes_after,
+        "raw_bytes_before": report.raw_bytes_before, "raw_bytes_after": report.raw_bytes_after,
+        "disk_bytes_before": report.disk_bytes_before,
+        "disk_bytes_after": None,  # measured after the rewrites, then the manifest is rewritten
+        "scan_seconds": round(report.scan_seconds, 3),
         "segments_rewritten": sorted(Path(s).name for s in rewrites),
     }
     manifest_path = archive_path[: -len(".jsonl")] + ".manifest.json"
     Path(manifest_path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    disk_after = {s: os.stat(s).st_size for s in segments}
     report.archive_path = archive_path
     report.manifest_path = manifest_path
 
@@ -310,6 +336,12 @@ def compact_journal(
                                  f"(archive {archive_path} already written; the rewrite of THIS "
                                  f"segment was skipped — re-run: replay stays idempotent)")
         write_segment(seg, "".join(kept))  # atomic, in the segment's own encoding (a compressed one stays compressed)
+        disk_after[seg] = os.stat(seg).st_size
+    report.disk_bytes_after = sum(disk_after.values())
+    report.rewrite_seconds = time.perf_counter() - t_write
+    manifest.update({"disk_bytes_after": report.disk_bytes_after,
+                     "rewrite_seconds": round(report.rewrite_seconds, 3)})
+    Path(manifest_path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return report
 
 

@@ -175,6 +175,22 @@ def partition_by_presence(
     return absent, present
 
 
+def stamp_op_time(
+    element: Dict[str, Any],  # A node or edge wire dict about to be ADDED
+    ts: Optional[float],      # The op clock's time (None: no window, the capability stamps now())
+) -> Dict[str, Any]:  # The same dict, stamped in place
+    """Stamp the op clock's time onto an element about to be added — the one function live
+    writes and replay share (design 8f6f2343). A carried time is kept; an explicit None is
+    ABSENT, never a carried time (finding b562d5f7: `setdefault` kept the correction core's
+    `"created_at": null`, so the capability stamped now() and a rebuild restamped 42.5k
+    nodes to the rebuild's own time)."""
+    if ts is not None:
+        for key in ("created_at", "updated_at"):
+            if element.get(key) is None:
+                element[key] = ts
+    return element
+
+
 @dataclass
 class ExtendResult:
     """Outcome of one idempotent extend_graph commit."""
@@ -206,7 +222,8 @@ async def extend_graph(
     result = ExtendResult()
     # The op clock (0d50b921, design 8f6f2343): inside a window — replay, or a live
     # write unit — stamp its ts onto everything ADDED, so live and rebuild agree.
-    # setdefault keeps any explicitly-carried stamp; outside a window, capability now().
+    # A carried stamp is kept, an explicit None is absent (`stamp_op_time`); outside a
+    # window, capability now().
     ts = PROVENANCE_TS.get()
 
     if nodes:
@@ -220,10 +237,8 @@ async def extend_graph(
                 raise GraphIntegrityError(f"node {n['id']}: {msg}")
         result.nodes_verified = len(present)
         if absent:
-            if ts is not None:
-                for n in absent:
-                    n.setdefault("created_at", ts)
-                    n.setdefault("updated_at", ts)
+            for n in absent:
+                stamp_op_time(n, ts)
             added = await graph_task(queue, graph_id, "add_nodes", nodes=absent)
             result.added_node_ids = list(added or [])
             result.nodes_added = len(result.added_node_ids)
@@ -235,10 +250,8 @@ async def extend_graph(
         absent_edges = [e for e in edges if e["id"] not in existing_eids]
         result.edges_existing = len(edges) - len(absent_edges)
         if absent_edges:
-            if ts is not None:
-                for e in absent_edges:
-                    e.setdefault("created_at", ts)
-                    e.setdefault("updated_at", ts)
+            for e in absent_edges:
+                stamp_op_time(e, ts)
             added = await graph_task(queue, graph_id, "add_edges", edges=absent_edges)
             result.added_edge_ids = list(added or [])
             result.edges_added = len(result.added_edge_ids)

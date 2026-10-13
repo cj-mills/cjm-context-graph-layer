@@ -1,5 +1,6 @@
 """Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search."""
 
+import json
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -147,6 +148,56 @@ def _page_counters(
     return out
 
 
+def _query_shape(
+    method: str,  # query_nodes | query_edges
+    query: Any,   # The typed query (or its wire dict)
+) -> str:  # The query's PLAN SHAPE: its structure, the values that never change a plan blanked
+    """A typed query reduced to what its plan depends on: ids, endpoints, predicate values and
+    page cursors become presence flags, so the storage door asks the backend for a plan once per
+    shape per run (the plan guard, design detail 3bd8673d) -- never once per call."""
+    def blank(key: str, v: Any) -> Any:
+        if key in ("ids", "source_ids", "target_ids", "source_id", "target_id", "after", "value",
+                   "values", "limit", "offset"):
+            return bool(v)
+        if isinstance(v, dict):
+            return {k: blank(k, x) for k, x in sorted(v.items())}
+        if isinstance(v, list):
+            return [blank(key, x) for x in v]
+        return v
+    return method + json.dumps(blank("", _wire(query)), sort_keys=True, default=str)
+
+
+async def _plan_scans(
+    queue: JobQueue,          # Started job queue
+    graph_id: str,            # Graph-storage capability instance id
+    method: str,              # query_nodes | query_edges
+    kwargs: Dict[str, Any],   # The call's kwargs (its `query`)
+    run: Any,                 # The armed run (its plan cache)
+) -> List[str]:  # What the query's plan reads whole ([] when nothing, or when unanswerable)
+    """The plan guard (design detail 3bd8673d, 681604c1): the backend's plan for this query's
+    shape, asked once per shape per run with the run DISARMED (its own cost is the `plans`
+    phase, never a storage row). Fail-open: a backend without `explain_query` answers []."""
+    query = kwargs.get("query")
+    if query is None:
+        return []
+    key = _query_shape(method, query)
+    if key not in run.plans:
+        token = CURRENT_RUN.set(None)
+        t = time.perf_counter()
+        try:
+            jid = await queue.submit(graph_id, task=GRAPH_TASK, method="explain_query", query=query)
+            job = await queue.wait_for_job(jid)
+            res = job.result if job.status == JobStatus.completed else None
+            res = res if isinstance(res, dict) else _wire(res or {})
+            run.plans[key] = list(res.get("scans") or [])
+        except Exception:
+            run.plans[key] = []
+        finally:
+            CURRENT_RUN.reset(token)
+            run.add("plans", time.perf_counter() - t)
+    return run.plans[key]
+
+
 async def _observed(
     queue: JobQueue,                # Started job queue
     graph_id: str,                  # Graph-storage capability instance id
@@ -208,12 +259,17 @@ async def graph_task(
     job = await queue.wait_for_job(jid)
     if job.status != JobStatus.completed:
         raise RuntimeError(f"{graph_id} {method} {job.status}: {job.error}")
-    if CURRENT_RUN.get() is not None:
+    run = CURRENT_RUN.get()
+    if run is not None:
         # The instrument (design detail 681604c1): the one storage door folds every call into
-        # the armed run -- seconds submit to result, rows each way, whole scope, and what the
-        # proxy measured on the job (wire bytes, the worker's own seconds, post / decode).
+        # the armed run -- seconds submit to result, rows each way, whole scope, what its plan
+        # reads whole (asked once per query shape, 3bd8673d), and what the proxy measured on the
+        # job (wire bytes, the worker's own seconds, post / decode).
+        seconds = time.perf_counter() - t
         rows_out = _rows_out(job.result)
-        record_storage(method, time.perf_counter() - t, whole=_whole_scope(method, kwargs),
+        scans = (await _plan_scans(queue, graph_id, method, kwargs, run)
+                 if method in ("query_nodes", "query_edges") else None)
+        record_storage(method, seconds, whole=_whole_scope(method, kwargs), scans=scans,
                        rows_in=_rows_in(method, kwargs), rows_out=rows_out,
                        **_page_counters(method, kwargs, rows_out),
                        **(getattr(job, "metrics", None) or {}))

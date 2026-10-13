@@ -210,3 +210,55 @@ def test_graph_task_folds_each_call_into_the_armed_run():
     finally:
         end_run(run)
     assert "at_limit" not in run.storage["query_nodes"]
+
+
+def test_graph_task_asks_each_query_shape_for_its_plan_once_per_run():
+    # The plan guard (design detail 3bd8673d): the storage door asks the backend's plan once
+    # per query SHAPE (ids and values blanked), with the run disarmed, and folds each call whose
+    # plan reads a table whole under its phase; a backend that cannot answer costs nothing.
+    import asyncio
+    from types import SimpleNamespace
+
+    from cjm_context_graph_layer.ops import graph_task
+    from cjm_context_graph_primitives.query import NodeQuery, NodeQueryResult, PropertyPredicate
+    from cjm_context_graph_primitives.timings import begin_run, end_run, span
+    from cjm_substrate.core.queue import JobStatus
+
+    class FakeQueue:
+        def __init__(self):
+            self.methods = []
+
+        async def submit(self, graph_id, **kw):
+            self.methods.append(kw["method"])
+            self.last = kw
+            return "j1"
+
+        async def wait_for_job(self, jid):
+            if self.last["method"] == "explain_query":
+                q = self.last["query"]
+                scans = ["nodes:label"] if q.get("where") else ([] if q.get("ids") else ["nodes"])
+                return SimpleNamespace(status=JobStatus.completed, error=None,
+                                       result={"plan": ["…"], "scans": scans})
+            return SimpleNamespace(status=JobStatus.completed, error=None,
+                                   result=NodeQueryResult(rows=[]))
+
+    q = FakeQueue()
+    run = begin_run("cli", "t")
+    try:
+        async def calls():
+            with span("verb"):
+                for slot in ("s1", "s2", "s3"):  # one shape, three values: one plan
+                    await graph_task(q, "g", "query_nodes", query=NodeQuery(
+                        label="Assertion", where=[PropertyPredicate("slot_id", "eq", slot)]).to_dict())
+                await graph_task(q, "g", "query_nodes", query=NodeQuery(ids=["a"]).to_dict())
+                await graph_task(q, "g", "query_nodes", query=NodeQuery(ids=["b", "c"]).to_dict())
+                await graph_task(q, "g", "query_nodes", query=NodeQuery(project=["id"]).to_dict())
+        asyncio.run(calls())
+    finally:
+        end_run(run)
+    assert q.methods.count("explain_query") == 3 and q.methods.count("query_nodes") == 6
+    assert run.storage["query_nodes"]["calls"] == 6 and "explain_query" not in run.storage
+    assert {k: v["calls"] for k, v in run.plan_scans.items()} == {
+        "verb :: query_nodes :: nodes:label": 3, "verb :: query_nodes :: nodes": 1}
+    assert run.phases["plans"]["calls"] == 3
+    assert run.event()["plan_scans"]["verb :: query_nodes :: nodes"]["calls"] == 1

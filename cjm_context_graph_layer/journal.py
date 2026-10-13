@@ -62,6 +62,7 @@ async def replay_journal(
     journal_path: str,  # Sidecar journal path
     handlers: Optional[Dict[str, Callable[..., Any]]] = None,  # Domain verb -> async handler(queue, graph_id, op)
     batch: int = 500,   # extend_graph flush size for genesis ops
+    offset: int = 0,    # Skip the first N ops: a delta replay of the journal's tail (idempotent)
 ) -> Dict[str, int]:  # Genesis add/verify counts + a count per handled domain verb
     """Re-apply every journaled op in append order — the db-from-journal rebuild.
 
@@ -92,6 +93,8 @@ async def replay_journal(
             pending_edges.clear()
 
     for position, op in enumerate(read_journal(journal_path)):
+        if position < offset:
+            continue
         verb = op.get("verb", "")
         if verb in (GENESIS_NODE, GENESIS_EDGE):
             # Replay provenance (0d50b921): stamp the op's journaled ts onto what it

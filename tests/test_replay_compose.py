@@ -123,3 +123,39 @@ def test_replay_records_each_verbs_cost_by_position(tmp_path, monkeypatch):
     assert run.phases["replay_journal"]["calls"] == 1
     assert run.phases["replay_journal/genesis_flush"]["calls"] == 1
     assert run.phases["replay_journal/read_journal"]["ops"] == 4
+
+
+def test_replay_from_an_offset_applies_only_the_tail(tmp_path, monkeypatch):
+    # A delta replay (the scale harness's, design detail 3bd8673d): the ops before the offset
+    # are read and skipped, the tail applied; positions stay journal positions.
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    from cjm_context_graph_layer.journal import GENESIS_NODE, replay_journal
+    from cjm_context_graph_primitives.timings import begin_run, end_run
+
+    jpath = tmp_path / "wf.writes.jsonl"
+    ops = ([{"verb": GENESIS_NODE, "ts": 1.0, "args": {"id": "n1", "label": "X", "properties": {}}}]
+           + [{"verb": "domain-op", "ts": 2.0, "args": {"i": i}} for i in range(4)])
+    jpath.write_text("".join(json.dumps(o) + "\n" for o in ops))
+    flushed = []
+
+    async def fake_extend(queue, graph_id, nodes, edges):
+        flushed.extend(nodes)
+        return SimpleNamespace(nodes_added=len(nodes), nodes_verified=0,
+                               edges_added=len(edges), edges_existing=0)
+    monkeypatch.setattr(journal_mod, "extend_graph", fake_extend)
+    seen = []
+
+    async def handler(queue, graph_id, op):
+        seen.append(op["args"]["i"])
+
+    run = begin_run("cli", "replay")
+    try:
+        counts = asyncio.run(replay_journal(None, "g", str(jpath), handlers={"domain-op": handler},
+                                            offset=3))
+    finally:
+        end_run(run)
+    assert seen == [2, 3] and counts["domain-op"] == 2 and not flushed  # genesis was before it
+    assert run.series["replay:domain-op"]["0"]["calls"] == 2

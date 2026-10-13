@@ -10,51 +10,88 @@ Disaster-recovery contract: target a FRESH db path (an existing target refuses
 without `--onto-existing`; replay is idempotent, so healing a live db is legal
 but opt-in). Paths are REQUIRED-EXPLICIT — no ambient defaults in a recovery
 tool (the explicit-graph-db-path guardrail).
+
+The proof is the layer's streamed comparison (`graphdiff`, ruling f8b9c728):
+`--against LIVE` compares the rebuild with the live db element for element —
+ids, every property, sources, both time columns — and `cjm-workflow-diff`
+compares any two workflow dbs. The workflow lane's known cause is DATA here
+(`WORKFLOW_ATTRIBUTION`); a difference nothing accounts for fails the proof.
 """
 
 import argparse
 import asyncio
-import hashlib
-import sqlite3
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
 
 from cjm_context_graph_primitives.journal import journal_segments
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 
+from .graphdiff import (Attribution, diff_stores, LagAttribution, MarkAttribution, PAGE,
+                        render_diff, STREAM_HISTORY)
 from .journal import composed_replay_handlers, replay_journal
 
+# The op clock's landing in the workflow writers (build 78a60b1a, design 8f6f2343): the
+# correction, decomp, transcription cores and this layer took it in one commit each at
+# 2026-09-29 20:03:29 -0700. Before it a live write stamped its own clock and the op's ts
+# was read a moment AFTER the write, so the history's live times precede the journaled ones
+# by the write's duration (median 0.25 s, max 3.67 s measured, finding b562d5f7 (3); bound 5 s,
+# ruling 0669404b (1)); after it they are equal. Before graph-sqlite 7417e3c (2026-08-05; a worker
+# ran it until at least 2026-08-28) update_node also kept the reserved updated_at key in the
+# properties blob: live holds the copy of its own column, the replay the birth value (ruling
+# 0669404b (2), 131 CorrectionSession nodes).
+OP_CLOCK_EPOCH = 1790737409.0
+WORKFLOW_ATTRIBUTION = (
+    LagAttribution("pre-op-clock", max_lag=5.0, before=OP_CLOCK_EPOCH),
+    MarkAttribution("reserved key in blob", field="properties.updated_at", column="updated_at",
+                    within=1.0),
+)
 
-def idset_digest(
-    db_path: str,  # A graph db (the sqlite capability's schema: nodes + edges tables)
-) -> Dict[str, Any]:  # {"nodes": n, "edges": n, "nodes_md5", "edges_md5"} over the SORTED id sets
-    """The rebuild-acceptance digest (craft P-49: ID-SET MD5 EQUALITY, never counts).
 
-    Two dbs are the same projection exactly when both digests match; a compaction
-    is PROVEN when the live db (retired wires deleted) and a fresh rebuild from
-    the compacted journal digest-equal. Read-only, direct sqlite (no worker): a
-    million ids sort in seconds."""
-    uri = f"file:{db_path}?mode=ro"
-    con = sqlite3.connect(uri, uri=True)
+@dataclass
+class GraphStore:
+    """A started graph: the queue + the capability id to address it."""
+
+    queue: JobQueue   # Started job queue (the task channel)
+    graph_id: str     # Graph-storage capability instance id
+
+
+@asynccontextmanager
+async def open_store(
+    db_path: str,          # The graph db (must exist when `readonly`)
+    manifests_dir: str,    # Capability manifests directory (workspace or explicit)
+    graph_capability: str = "cjm-capability-graph-sqlite",  # Graph-storage capability name
+    readonly: bool = False,  # Open the db read-only (URI mode=ro: any write raises at SQLite)
+    max_history: int = 100,  # Completed jobs the queue retains, results included
+) -> AsyncIterator[GraphStore]:  # The started store
+    """Stand up the graph capability on `db_path` and a started queue — the cores' own runtime
+    pattern, so a rebuild writes through the SAME worker path every live write used. Graph ops
+    are ambient work (DEC 8bf656c0): their per-op accounting stays out of the substrate journal."""
+    manager = CapabilityManager(search_paths=[Path(manifests_dir)])
+    manager.discover_manifests()
+    discovered = {m.name: m for m in manager.discovered}
+    meta = discovered.get(graph_capability)
+    if meta is None:
+        raise ValueError(f"open_store: capability {graph_capability!r} not found in "
+                         f"{manifests_dir} (discovered: {sorted(discovered)})")
+    config: Dict[str, Any] = {"db_path": db_path}
+    if readonly:
+        if not Path(db_path).exists():
+            raise ValueError(f"open_store: a read-only graph must exist: {db_path}")
+        config["readonly"] = True
+    if not manager.load_capability(meta, config=config):
+        raise ValueError(f"open_store: failed to load capability {graph_capability!r}")
+    if hasattr(manager, "set_observability_class"):
+        manager.set_observability_class(graph_capability, "ambient")
+    queue = JobQueue(deps=manager, max_history=max_history)
+    await queue.start()
     try:
-        out: Dict[str, Any] = {}
-        for table in ("nodes", "edges"):
-            ids = sorted(r[0] for r in con.execute(f"SELECT id FROM {table}"))
-            h = hashlib.md5()
-            for i in ids:
-                h.update(i.encode("utf-8"))
-                h.update(b"\n")
-            out[table] = len(ids)
-            out[f"{table}_md5"] = h.hexdigest()
-        return out
+        yield GraphStore(queue=queue, graph_id=graph_capability)
     finally:
-        con.close()
-
-
-def digests_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:  # Same node AND edge id sets
-    """True when two `idset_digest` results describe the same projection."""
-    return a.get("nodes_md5") == b.get("nodes_md5") and a.get("edges_md5") == b.get("edges_md5")
+        await queue.stop()
+        manager.unload_capability(graph_capability)
 
 
 async def rebuild_db(
@@ -66,35 +103,37 @@ async def rebuild_db(
 ) -> Dict[str, int]:  # replay_journal's counts: genesis adds/verifies + per-verb tallies
     """Rebuild `db_path` from the journal — substrate standup + composed replay.
 
-    Mirrors the cores' own runtime pattern (manager -> graph capability with a
-    `db_path` load-config override -> started queue) so the rebuild writes through
-    the SAME worker path every live write used. Idempotent end to end: genesis
-    ops verify-collide, wire ops re-extend, `session-status` replays last-wins."""
-    manager = CapabilityManager(search_paths=[Path(manifests_dir)])
-    manager.discover_manifests()
-    discovered = {m.name: m for m in manager.discovered}
-    meta = discovered.get(graph_capability)
-    if meta is None:
-        raise ValueError(f"rebuild_db: capability {graph_capability!r} not found in "
-                         f"{manifests_dir} (discovered: {sorted(discovered)})")
-    if not manager.load_capability(meta, config={"db_path": db_path}):
-        raise ValueError(f"rebuild_db: failed to load capability {graph_capability!r}")
-    queue = JobQueue(deps=manager)
-    await queue.start()
-    try:
-        return await replay_journal(queue, graph_capability, journal_path,
+    Idempotent end to end: genesis ops verify-collide, wire ops re-extend,
+    `session-status` replays last-wins."""
+    async with open_store(db_path, manifests_dir, graph_capability) as gx:
+        return await replay_journal(gx.queue, gx.graph_id, journal_path,
                                     handlers=handlers if handlers is not None
                                     else composed_replay_handlers())
-    finally:
-        await queue.stop()
-        manager.unload_capability(graph_capability)
 
 
-def main(argv: Optional[List[str]] = None) -> int:  # Process exit code
+async def diff_dbs(
+    db_a: str,           # Graph A (by convention the LIVE db), opened read-only
+    db_b: str,           # Graph B (by convention its REBUILD), opened read-only
+    manifests_dir: str,  # Capability manifests directory
+    graph_capability: str = "cjm-capability-graph-sqlite",  # Graph-storage capability name
+    attribution: Sequence[Attribution] = WORKFLOW_ATTRIBUTION,  # The lane's known causes
+    page: int = PAGE,    # Elements per keyset page
+) -> Dict[str, Any]:  # The graphdiff report + the two paths
+    """Compare two workflow dbs element for element, both read-only, streamed side by side."""
+    async with open_store(db_a, manifests_dir, graph_capability, readonly=True,
+                          max_history=STREAM_HISTORY) as ga, \
+            open_store(db_b, manifests_dir, graph_capability, readonly=True,
+                       max_history=STREAM_HISTORY) as gb:
+        res = await diff_stores(ga, gb, attribution=attribution, page=page)
+    return {**res, "a": db_a, "b": db_b}
+
+
+def main(argv: Optional[List[str]] = None) -> int:  # Process exit code (3 = the proof found differences)
     """The `cjm-workflow-rebuild` console entrypoint — one command, fresh db from journal.
 
     Every path is REQUIRED-EXPLICIT (recovery tools get no ambient defaults);
-    an existing `--db` target refuses without `--onto-existing`."""
+    an existing `--db` target refuses without `--onto-existing`. `--against LIVE`
+    proves the rebuild against the live db once it is built."""
     parser = argparse.ArgumentParser(
         prog="cjm-workflow-rebuild",
         description="Rebuild a workflow graph db from its journal (segment-family aware).")
@@ -106,6 +145,9 @@ def main(argv: Optional[List[str]] = None) -> int:  # Process exit code
                         help="Graph-storage capability name (default: %(default)s)")
     parser.add_argument("--onto-existing", action="store_true",
                         help="Allow an EXISTING --db target (idempotent replay heals it)")
+    parser.add_argument("--against", default=None, metavar="LIVE_DB",
+                        help="After the rebuild, compare it with LIVE_DB element for element "
+                             "(read-only); exit 3 on any unattributed difference")
     args = parser.parse_args(argv)
     if Path(args.db).exists() and not args.onto_existing:
         parser.error(f"target db exists: {args.db} — rebuild targets a FRESH path "
@@ -118,4 +160,29 @@ def main(argv: Optional[List[str]] = None) -> int:  # Process exit code
                                     graph_capability=args.graph_capability))
     for key in sorted(counts):
         print(f"  {key}: {counts[key]}")
-    return 0
+    if args.against is None:
+        return 0
+    res = asyncio.run(diff_dbs(args.against, args.db, args.manifests_dir,
+                               graph_capability=args.graph_capability))
+    print(render_diff(res))
+    return 0 if res["clean"] else 3
+
+
+def diff_main(argv: Optional[List[str]] = None) -> int:  # Process exit code (3 = differences)
+    """The `cjm-workflow-diff` console entrypoint — two existing workflow dbs, compared
+    element for element with the workflow lane's attribution (both opened read-only)."""
+    parser = argparse.ArgumentParser(
+        prog="cjm-workflow-diff",
+        description="Compare two workflow graph dbs element for element (the rebuild proof).")
+    parser.add_argument("a", help="Graph A (by convention the LIVE db)")
+    parser.add_argument("b", help="Graph B (by convention its REBUILD)")
+    parser.add_argument("--manifests-dir", required=True, help="Capability manifests directory")
+    parser.add_argument("--graph-capability", default="cjm-capability-graph-sqlite",
+                        help="Graph-storage capability name (default: %(default)s)")
+    parser.add_argument("--page", type=int, default=PAGE, help="Elements per keyset page")
+    parser.add_argument("--format", choices=("human", "agent"), default="human")
+    args = parser.parse_args(argv)
+    res = asyncio.run(diff_dbs(args.a, args.b, args.manifests_dir,
+                               graph_capability=args.graph_capability, page=args.page))
+    print(render_diff(res, args.format))
+    return 0 if res["clean"] else 3

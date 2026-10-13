@@ -11,7 +11,7 @@ does not glob), with a manifest naming what moved and from where. Provenance is 
 the active family shrinks, and a rebuild replays less.
 
 Invariants the verb enforces (the static proof; the optional full proof is a rebuild
-compared by id-set digest, `rebuild.idset_digest`):
+compared with the live db element for element, `rebuild.diff_dbs`):
   1. NOTHING OUTSIDE THE ARCHIVE REFERENCES A RETIRED ID after compaction — a kept op
      that still names a retired node (a correction on it, a mark, a nudge) REFUSES the
      whole run before any byte is written; deletes are the tolerated exception (a delete

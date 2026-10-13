@@ -11,6 +11,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - **`cjm_context_graph_layer.declare`** — Provenance-by-declaration: host logic stays readable Python in the workflow core and DECLARES its provenance contributions as a Derivation event node (+ DERIVED_FROM input edges, PRODUCED output edges). This recovers audit completeness without the substrate executing host logic (pass-2 Thread 4's false-dichotomy resolution). The substrate stays untouched: declarations read composition/job ids from the outside.
 - **`cjm_context_graph_layer.edits`** — The spine-edit operation vocabulary (prune / replace_text / boundary_shift) + supersession resolution + the effective-view projection. These are generic operations on any NEXT-chained text spine; correction workflows carry them in overlay-node payloads, and the projection interprets them at read time (migrates correction-core C11/C16 onto the layer).
 - **`cjm_context_graph_layer.grammar`** — The domain-neutral context-graph grammar: spine relations (NEXT / PART_OF / STARTS_WITH, recurring fractally at every layer), overlay relations (SUPERSEDES / DERIVED_FROM / PRODUCED), root kinds, and the standardized attribution fields.
+- **`cjm_context_graph_layer.graphdiff`** — Two graphs compared element for element, streamed: the one standing check for every lane (ruling f8b9c728).
 - **`cjm_context_graph_layer.identity`** — Deterministic node/edge identity: UUIDv5 over canonical identity tuples (stage-5 ratified rule: a node's id derives from what makes it THE same node across re-derivation, never from its correctable content).
 - **`cjm_context_graph_layer.journal`** — Journal replay for workflow graphs — the genesis baseline + the pluggable verb registry.
 - **`cjm_context_graph_layer.ops`** — Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search.
@@ -50,6 +51,24 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `make_edge` _function_ — Build an edge wire dict with a deterministic id by default.
 - `spine_edges` _function_ — The uniform spine pattern at any layer: PART_OF child->parent for each
 
+### `cjm_context_graph_layer.graphdiff`
+
+- `IdAttribution` _class_ — The elements a known cause accounts for, by id: every difference on them is the cause's.
+- `KindDiff` _class_ — The comparison of one element kind, fed one id-aligned pair at a time (either side may
+- `LagAttribution` _class_ — A time field whose A value precedes B's by under `max_lag` seconds, on an element written
+- `MarkAttribution` _class_ — A property carrying a copy of its element's own time column in A, where B holds an
+- `amerge_sorted` _function_ — `merge_sorted` over two async streams.
+- `compared_fields` _function_ — The compared fields of one element: its structural fields, each property key on its
+- `diff_graphs` _function_ — The comparison over elements already in memory (tests, small graphs): sorted by id,
+- `diff_stores` _function_ — Compare two graphs element for element, streamed: O(page) memory per side.
+- `merge_sorted` _function_ — Merge two id-ordered element streams into (A, B) pairs, None where a side lacks the id.
+- `normalize` _function_ — Rewrite mapped path prefixes in every string, recursively (keys stay as they are).
+- `render_diff` _function_ — Markdown (the verdict, the two graphs, the drift map by kind), or JSON for agents.
+- `render_head` _function_ — The verdict line: CLEAN or DIFFERENCES, and what each cause accounts for.
+- `render_kinds` _function_ — The drift map by kind, class and field; rows a cause accounts for print under each kind
+- `stream_elements` _function_ — Every node (or edge) of a graph through the storage capability, in id-ordered keyset
+- `wire` _function_ — The wire dict of a typed graph element (task results may arrive typed or as dicts).
+
 ### `cjm_context_graph_layer.identity`
 
 - `canonical_part` _function_ — Render one identity-tuple part canonically.
@@ -79,9 +98,11 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 
 ### `cjm_context_graph_layer.rebuild`
 
-- `digests_equal` _function_ — True when two `idset_digest` results describe the same projection.
-- `idset_digest` _function_ — The rebuild-acceptance digest (craft P-49: ID-SET MD5 EQUALITY, never counts).
+- `GraphStore` _class_ — A started graph: the queue + the capability id to address it.
+- `diff_dbs` _function_ — Compare two workflow dbs element for element, both read-only, streamed side by side.
+- `diff_main` _function_ — The `cjm-workflow-diff` console entrypoint — two existing workflow dbs, compared
 - `main` _function_ — The `cjm-workflow-rebuild` console entrypoint — one command, fresh db from journal.
+- `open_store` _function_ — Stand up the graph capability on `db_path` and a started queue — the cores' own runtime
 - `rebuild_db` _function_ — Rebuild `db_path` from the journal — substrate standup + composed replay.
 
 ## Dependencies

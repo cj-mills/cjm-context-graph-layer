@@ -4,14 +4,12 @@ the live tail is never rewritten, idempotent."""
 
 import json
 import os
-import sqlite3
 from pathlib import Path
 
 import pytest
 from cjm_context_graph_layer.compact import (archive_segments, compact_journal, CompactRefusal,
                                              next_archive_path, scan_references)
 from cjm_context_graph_layer.journal import GENESIS_EDGE, GENESIS_NODE
-from cjm_context_graph_layer.rebuild import digests_equal, idset_digest
 from cjm_context_graph_primitives.journal import (compress_cold_segments, journal_segments,
                                                   read_journal, read_segment)
 
@@ -174,21 +172,3 @@ def test_report_measures_raw_and_disk_bytes_apart_on_a_compressed_family(tmp_pat
     manifest = json.loads(Path(rep.manifest_path).read_text())
     assert manifest["disk_bytes_after"] == rep.disk_bytes_after
     assert manifest["raw_bytes_before"] == rep.raw_bytes_before
-
-
-def test_idset_digest_equality_is_id_set_equality(tmp_path):
-    def mk(path, node_ids, edge_ids):
-        con = sqlite3.connect(path)
-        con.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, label TEXT)")
-        con.execute("CREATE TABLE edges (id TEXT PRIMARY KEY, source_id TEXT, target_id TEXT)")
-        con.executemany("INSERT INTO nodes VALUES (?, 'X')", [(i,) for i in node_ids])
-        con.executemany("INSERT INTO edges VALUES (?, 'a', 'b')", [(i,) for i in edge_ids])
-        con.commit()
-        con.close()
-    a, b, c = (str(tmp_path / f"{n}.db") for n in "abc")
-    mk(a, ["n1", "n2"], ["e1"])
-    mk(b, ["n2", "n1"], ["e1"])       # same sets, different insertion order
-    mk(c, ["n1", "n2", "n3"], ["e1"])
-    da, db, dc = idset_digest(a), idset_digest(b), idset_digest(c)
-    assert da["nodes"] == 2 and da["edges"] == 1
-    assert digests_equal(da, db) and not digests_equal(da, dc)

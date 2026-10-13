@@ -18,6 +18,7 @@ dependencies = ['cjm-context-graph-primitives>=0.0.17', 'cjm-substrate>=0.0.51']
 
 [project.scripts]
 cjm-workflow-rebuild = "cjm_context_graph_layer.rebuild:main"
+cjm-workflow-diff = "cjm_context_graph_layer.rebuild:diff_main"
 
 [project.urls]
 Repository = "https://github.com/cj-mills/cjm-context-graph-layer"

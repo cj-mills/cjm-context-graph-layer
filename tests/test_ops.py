@@ -262,3 +262,39 @@ def test_graph_task_asks_each_query_shape_for_its_plan_once_per_run():
         "verb :: query_nodes :: nodes:label": 3, "verb :: query_nodes :: nodes": 1}
     assert run.phases["plans"]["calls"] == 3
     assert run.event()["plan_scans"]["verb :: query_nodes :: nodes"]["calls"] == 1
+
+
+def test_store_covariates_disarmed_and_fail_open():
+    """The store half of the covariates (design detail 4389a579): one get_schema, measured
+    with the run disarmed (its storage table holds the run's own calls alone), its cost the
+    `covariates` phase; a failing store answers {error}, never raises."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from cjm_context_graph_layer.ops import store_covariates
+    from cjm_context_graph_primitives.timings import begin_run, end_run
+    from cjm_substrate.core.queue import JobStatus
+
+    class FakeQueue:
+        def __init__(self, fail=False):
+            self.fail = fail
+
+        async def submit(self, graph_id, **kw):
+            return "j1"
+
+        async def wait_for_job(self, jid):
+            if self.fail:
+                return SimpleNamespace(status=JobStatus.failed, error="boom", result=None)
+            return SimpleNamespace(status=JobStatus.completed, error=None, result={
+                "counts": {"Segment": 5, "Decision": 2}, "edge_count": 9, "db_bytes": 4096})
+
+    run = begin_run("gesture", "app:g")
+    try:
+        cov = asyncio.run(store_covariates(FakeQueue(), "g"))
+        bad = asyncio.run(store_covariates(FakeQueue(fail=True), "g"))
+    finally:
+        end_run(run)
+    assert cov == {"nodes": 7, "edges": 9, "db_bytes": 4096,
+                   "kinds": {"Decision": 2, "Segment": 5}}
+    assert "boom" in bad["error"]
+    assert run.storage == {} and run.phases["covariates"]["calls"] == 2

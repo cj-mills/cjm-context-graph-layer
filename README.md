@@ -95,6 +95,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `observe_writes` _function_ — Collect every storage write made inside the block, one record per write:
 - `partition_by_presence` _function_ — Split wire dicts into absent (to add) and present (to verify).
 - `stamp_op_time` _function_ — Stamp the op clock's time onto an element about to be added — the one function live
+- `store_covariates` _function_ — The store half of the instrument's growth covariates (design detail 681604c1): the nodes,
 
 ### `cjm_context_graph_layer.rebuild`
 
@@ -108,4 +109,4 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 ## Dependencies
 
 **Depends on:** `cjm-context-graph-primitives`, `cjm-substrate`
-**Used by:** `cjm-context-graph-projection`, `cjm-dev-graph-schema`, `cjm-markdown-decompose-core`, `cjm-notebook-decompose-core`, `cjm-session-scratchpad-qt`, `cjm-transcript-correction-core`, `cjm-transcript-correction-qt`, `cjm-transcript-decomp-core`, `cjm-transcript-graph-schema`, `cjm-transcription-core`, `cjm-workflow-hub-qt`
+**Used by:** `cjm-context-graph-projection`, `cjm-dev-graph-schema`, `cjm-markdown-decompose-core`, `cjm-notebook-decompose-core`, `cjm-session-scratchpad-qt`, `cjm-transcript-correction-core`, `cjm-transcript-correction-qt`, `cjm-transcript-decomp-core`, `cjm-transcript-decomp-qt`, `cjm-transcript-graph-schema`, `cjm-transcription-core`, `cjm-workflow-hub-qt`

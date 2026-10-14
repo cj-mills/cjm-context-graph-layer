@@ -276,6 +276,32 @@ async def graph_task(
     return job.result
 
 
+async def store_covariates(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability instance id
+) -> Dict[str, Any]:  # {nodes, edges, db_bytes, kinds}, or {error}
+    """The store half of the instrument's growth covariates (design detail 681604c1): the nodes,
+    edges and bytes of the store and the nodes per kind, from one get_schema -- O(graph), so a
+    caller measures it beside its run, never inside every one (the gesture seam measures it at
+    open and on a timer, design detail 4389a579). Measured with the run DISARMED, so the armed
+    run's storage table holds its own calls alone; its cost is the run's `covariates` phase.
+    Never raises: the instrument must not break the work it measures."""
+    run = CURRENT_RUN.get()
+    token = CURRENT_RUN.set(None)
+    t = time.perf_counter()
+    try:
+        schema = await graph_task(queue, graph_id, "get_schema")
+        kinds = dict(sorted((schema.get("counts") or {}).items()))
+        return {"nodes": sum(kinds.values()), "edges": schema.get("edge_count"),
+                "db_bytes": schema.get("db_bytes"), "kinds": kinds}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        CURRENT_RUN.reset(token)
+        if run is not None:
+            run.add("covariates", time.perf_counter() - t)
+
+
 class GraphIntegrityError(RuntimeError):
     """An emitted node collided with an existing node of different identity content.
 

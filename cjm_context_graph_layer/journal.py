@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from cjm_context_graph_primitives.journal import append_op, op_clock, read_journal
 from cjm_context_graph_primitives.query import EdgeQuery, NodeQuery
-from cjm_context_graph_primitives.timings import record_series, span, timed
+from cjm_context_graph_primitives.timings import record_replay, record_series, span, timed
 
 from .ops import extend_graph, ExtendResult, graph_task, PROVENANCE_TS, stamp_op_time
 
@@ -95,6 +95,7 @@ async def replay_journal(
     for position, op in enumerate(read_journal(journal_path)):
         if position < offset:
             continue
+        record_replay(journal_path, op)  # the replay's logical size (ruling 9af0e42e (3))
         verb = op.get("verb", "")
         if verb in (GENESIS_NODE, GENESIS_EDGE):
             # Replay provenance (0d50b921): stamp the op's journaled ts onto what it

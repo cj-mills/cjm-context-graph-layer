@@ -11,6 +11,7 @@ from cjm_context_graph_primitives.journal import PROVENANCE_TS
 from cjm_context_graph_primitives.query import (EdgeQuery, EdgeQueryResult, NodeQuery,
                                                 NodeQueryResult)
 from cjm_context_graph_primitives.timings import CURRENT_RUN, record_storage
+from cjm_context_graph_primitives.writer import JournalPosition
 from cjm_substrate.core.queue import JobQueue, JobStatus
 
 # Importing the typed query/result classes IS the host-side wire registration
@@ -300,6 +301,31 @@ async def store_covariates(
         CURRENT_RUN.reset(token)
         if run is not None:
             run.add("covariates", time.perf_counter() - t)
+
+
+@dataclass
+class GraphCursorStore:
+    """A graph store's applied cursors as a writer's CursorStore (design detail 65f4a6c9 (2c)): the
+    capability's journal_cursors through the one storage door, beside the graph and never in it --
+    so neither the op clock nor the write observer sees a cursor write."""
+
+    queue: JobQueue  # Started job queue
+    graph_id: str    # Graph-storage capability instance id
+
+    async def read(
+        self,
+        family: str,  # The journal family (its live tail's file name)
+    ) -> Optional[JournalPosition]:  # The db's cursor for it, or None when it holds none
+        held = (await graph_task(self.queue, self.graph_id, "journal_cursors") or {}).get(family)
+        return JournalPosition.from_dict(held) if held else None
+
+    async def record(
+        self,
+        family: str,                # The journal family
+        position: JournalPosition,  # Just past the last record applied
+    ) -> None:
+        await graph_task(self.queue, self.graph_id, "record_journal_cursor",
+                         family=family, position=position.to_dict())
 
 
 class GraphIntegrityError(RuntimeError):

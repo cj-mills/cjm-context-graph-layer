@@ -151,6 +151,68 @@ def test_journal_extend_stamps_adds_with_the_journaled_ts(tmp_path):
     assert [(n["created_at"], n["updated_at"]) for n in added["nodes"]] == [(ts, ts)]
 
 
+def test_graph_cursor_store_and_apply_op_through_the_storage_door(tmp_path):
+    # Design detail 65f4a6c9: the cursors cross the one storage door as plain dicts (never a
+    # write the observer sees), and a graph writer applies through replay's own apply_op --
+    # a genesis op at its journaled ts, a domain verb through its handler, an unknown verb loud
+    import asyncio
+    from types import SimpleNamespace
+
+    import pytest
+    from cjm_context_graph_layer.journal import apply_op, graph_writer
+    from cjm_context_graph_layer.ops import GraphCursorStore, observe_writes
+    from cjm_context_graph_primitives.journal import read_journal
+    from cjm_context_graph_primitives.writer import ORIGIN, stamp_cursor
+    from cjm_substrate.core.queue import JobStatus
+
+    class FakeQueue:
+        def __init__(self):
+            self.submitted, self.cursors = [], {}
+
+        async def submit(self, graph_id, **kw):
+            self.submitted.append(kw)
+            return "j1"
+
+        async def wait_for_job(self, jid):
+            kw = self.submitted[-1]
+            if kw["method"] == "record_journal_cursor":
+                self.cursors[kw["family"]] = kw["position"]
+                result = True
+            elif kw["method"] == "journal_cursors":
+                result = dict(self.cursors)
+            elif kw["method"] == "query_nodes":
+                result = SimpleNamespace(nodes=[], edges=[])
+            else:
+                result = ["n1"]
+            return SimpleNamespace(status=JobStatus.completed, result=result, error=None)
+
+    q = FakeQueue()
+    store = GraphCursorStore(q, "g")
+    j = str(tmp_path / "w.writes.jsonl")
+    with observe_writes() as writes:
+        assert asyncio.run(store.read("w.writes.jsonl")) is None
+        assert asyncio.run(stamp_cursor(j, store)) == ORIGIN
+    assert writes == [] and q.cursors["w.writes.jsonl"] == ORIGIN.to_dict()
+
+    seen = []
+
+    async def handler(queue, graph_id, op):
+        seen.append(op["args"])
+
+    async def write():
+        async with graph_writer(q, "g", j, {"note": handler}) as w:
+            await w.write({"verb": "note", "args": {"x": 1}})
+            await w.write({"verb": "genesis-node", "args": {"id": "n1", "label": "L", "properties": {}}})
+
+    asyncio.run(write())
+    ts = read_journal(j)[1]["ts"]
+    added = next(kw for kw in q.submitted if kw["method"] == "add_nodes")
+    assert seen == [{"x": 1}] and added["nodes"][0]["created_at"] == ts
+    assert q.cursors["w.writes.jsonl"]["ordinal"] == 2
+    with pytest.raises(ValueError, match="no handler for verb 'nope'"):
+        asyncio.run(apply_op(q, "g", {"verb": "nope"}, {}))
+
+
 def test_graph_task_folds_each_call_into_the_armed_run():
     # The instrument (design detail 681604c1): the one storage door records every call by
     # method -- rows each way, the proxy's measurements off the job, and whole scope under the

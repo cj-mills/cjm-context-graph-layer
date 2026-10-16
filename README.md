@@ -77,9 +77,11 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 
 ### `cjm_context_graph_layer.journal`
 
+- `apply_op` _function_ — Apply ONE journaled op -- the dispatch replay runs per op and a live writer runs after its
 - `apply_wires` _function_ — The generic replay handler for wire-carrying ops (the single wires-replay authority).
 - `composed_replay_handlers` _function_ — Union every installed core's replay registry (DEC 426658f1 — the d066826a fix).
 - `genesis_export` _function_ — One-time whole-db GENESIS BASELINE: journal every node + edge as genesis ops.
+- `graph_writer` _function_ — The write order on a workflow graph (design detail 65f4a6c9): a JournalWriter whose cursors
 - `journal_extend` _function_ — Idempotent extend + journal the DELTA — the pipeline-write append-through.
 - `replay_journal` _function_ — Re-apply every journaled op in append order — the db-from-journal rebuild.
 - `sidecar_journal_path` _function_ — The db's sidecar journal path (DEC ccbab9f5 point 3: placement is per-workflow,
@@ -88,6 +90,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 ### `cjm_context_graph_layer.ops`
 
 - `ExtendResult` _class_ — Outcome of one idempotent extend_graph commit.
+- `GraphCursorStore` _class_ — A graph store's applied cursors as a writer's CursorStore (design detail 65f4a6c9 (2c)): the
 - `GraphIntegrityError` _class_ — An emitted node collided with an existing node of different identity content.
 - `extend_graph` _function_ — Idempotently extend the graph: emit-if-absent + verify-if-present.
 - `graph_task` _function_ — Invoke a graph-storage adapter method through the queue's task channel.

@@ -15,8 +15,10 @@ from typing import Any, Callable, Dict, List, Optional
 from cjm_context_graph_primitives.journal import append_op, op_clock, read_journal
 from cjm_context_graph_primitives.query import EdgeQuery, NodeQuery
 from cjm_context_graph_primitives.timings import record_replay, record_series, span, timed
+from cjm_context_graph_primitives.writer import JournalWriter
 
-from .ops import extend_graph, ExtendResult, graph_task, PROVENANCE_TS, stamp_op_time
+from .ops import (extend_graph, ExtendResult, graph_task, GraphCursorStore, PROVENANCE_TS,
+                  stamp_op_time)
 
 GENESIS_NODE = "genesis-node"  # One node's whole-db baseline op (args = the node wire dict)
 GENESIS_EDGE = "genesis-edge"  # One edge's whole-db baseline op (args = the edge wire dict)
@@ -53,6 +55,36 @@ async def genesis_export(
         append_op(journal_path, {"verb": GENESIS_EDGE, "id": f"{GENESIS_EDGE}:{e.id}",
                                  "actor": actor, "args": e.to_dict()}, dedup=False)
     return {"nodes": len(nodes), "edges": len(edges)}
+
+
+async def apply_op(
+    queue: Any,                    # Started job queue
+    graph_id: str,                 # Graph-storage capability id
+    op: Dict[str, Any],            # One journaled op
+    handlers: Dict[str, Callable[..., Any]],  # Domain verb -> async handler(queue, graph_id, op)
+) -> str:  # The verb applied
+    """Apply ONE journaled op -- the dispatch replay runs per op and a live writer runs after its
+    append (design detail 65f4a6c9 (1): one applier, live and rebuild). A genesis op extends at
+    its journaled ts (`stamp_op_time`); a domain verb runs its registered handler inside the op's
+    provenance window, so whatever it mints re-stamps to that ts. An unregistered verb raises
+    LOUDLY: silently skipping an op would leave a db missing knowledge the journal holds."""
+    verb = op.get("verb", "")
+    if verb in (GENESIS_NODE, GENESIS_EDGE):
+        wire = stamp_op_time(op["args"], op.get("ts"))
+        await extend_graph(queue, graph_id, [wire] if verb == GENESIS_NODE else [],
+                           [wire] if verb == GENESIS_EDGE else [])
+        return verb
+    if verb not in handlers:
+        raise ValueError(f"apply_op: no handler for verb {verb!r} — "
+                         f"refusing to silently drop journaled knowledge "
+                         f"(is the core owning it installed in this env? "
+                         f"composed_replay_handlers unions every installed registry)")
+    token = PROVENANCE_TS.set(op.get("ts"))
+    try:
+        await handlers[verb](queue, graph_id, op)
+    finally:
+        PROVENANCE_TS.reset(token)
+    return verb
 
 
 @timed("replay_journal")
@@ -107,19 +139,10 @@ async def replay_journal(
             (pending_nodes if verb == GENESIS_NODE else pending_edges).append(args)
         else:
             await flush()
-            if verb not in handlers:
-                raise ValueError(f"replay_journal: no handler for verb {verb!r} — "
-                                 f"refusing to silently drop journaled knowledge "
-                                 f"(is the core owning it installed in this env? "
-                                 f"composed_replay_handlers unions every installed registry)")
-            # Domain handlers run inside the replay provenance window: whatever
-            # they mint through extend_graph / update_node re-stamps to op ts.
-            token = PROVENANCE_TS.set(op.get("ts"))
+            # One applier, live and rebuild (65f4a6c9 (1)): the handler runs inside the op's
+            # provenance window, so whatever it mints re-stamps to op ts.
             t = time.perf_counter()
-            try:
-                await handlers[verb](queue, graph_id, op)
-            finally:
-                PROVENANCE_TS.reset(token)
+            await apply_op(queue, graph_id, op, handlers)
             # The instrument (681604c1): a verb's cost against its journal position -- flat
             # when healthy, rising when an op's cost grows with the history before it
             record_series(f"replay:{verb}", position, time.perf_counter() - t)
@@ -163,6 +186,18 @@ def wires_handlers(
     Keeps `replay_journal`'s loud-unknown-verb guarantee intact — verbs are
     registered EXPLICITLY, never inferred from op shape."""
     return dict.fromkeys(verbs, apply_wires)
+
+
+def graph_writer(
+    queue: Any,         # Started job queue
+    graph_id: str,      # Graph-storage capability id
+    journal_path: str,  # The graph's journal family (its live tail)
+    handlers: Dict[str, Callable[..., Any]],  # Domain verb -> async handler(queue, graph_id, op)
+) -> JournalWriter:  # `async with` it: lock, heal, then plan and write
+    """The write order on a workflow graph (design detail 65f4a6c9): a JournalWriter whose cursors
+    live in the graph store beside the graph and whose applier is replay's own `apply_op`."""
+    return JournalWriter(journal_path, GraphCursorStore(queue, graph_id),
+                         lambda op: apply_op(queue, graph_id, op, handlers))
 
 
 async def journal_extend(

@@ -23,10 +23,14 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 
 - `CompactRefusal` _class_ — Compaction refused before writing: a kept op still references a retired id
 - `CompactReport` _class_ — What a compaction did (or, dry-run, would do).
+- `CompactionPlan` _class_ — A compaction scanned and resolved, nothing written (ruling 6683f49e (3)): what moves, where
 - `DanglingRef` _class_ — One kept op that names a retired id — the reason a compaction refuses.
 - `archive_segments` _function_ — The archive family beside a journal: `<stem>.retired.NNNN.jsonl` under `archive_dir`.
-- `compact_journal` _function_ — Move every wire on the retired ids out of the journal family into ONE new archive segment.
+- `compact_family` _function_ — A db-backed family's compaction, THE OP FIRST (ruling 6683f49e (3)): under the writer's
+- `compact_journal` _function_ — Move every wire on the retired ids out of the journal family into ONE new archive segment
+- `move_compaction` _function_ — THE STORAGE MOVE: write the archive segment + manifest, then rewrite each changed segment
 - `next_archive_path` _function_
+- `plan_compaction` _function_ — THE SCAN: classify every op of the family's cold segments -- moved whole, split, kept --
 - `scan_references` _function_ — The post-compaction static check: the family names none of the retired ids.
 
 ### `cjm_context_graph_layer.declare`
@@ -60,7 +64,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `amerge_sorted` _function_ — `merge_sorted` over two async streams.
 - `compared_fields` _function_ — The compared fields of one element: its structural fields, each property key on its
 - `diff_graphs` _function_ — The comparison over elements already in memory (tests, small graphs): sorted by id,
-- `diff_stores` _function_ — Compare two graphs element for element, streamed: O(page) memory per side.
+- `diff_stores` _function_ — Compare two graphs element for element, streamed: O(page) memory per side (plus, with
 - `merge_sorted` _function_ — Merge two id-ordered element streams into (A, B) pairs, None where a side lacks the id.
 - `normalize` _function_ — Rewrite mapped path prefixes in every string, recursively (keys stay as they are).
 - `render_diff` _function_ — Markdown (the verdict, the two graphs, the drift map by kind), or JSON for agents.
@@ -77,18 +81,22 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 
 ### `cjm_context_graph_layer.journal`
 
+- `MissingRegistry` _class_ — The env lacks a replay registry the workflow lane declares: refused when a writer opens,
+- `UnjournaledWrite` _class_ — A write on a journal-sourced graph with no journal path and no explicit `unjournaled=True`
 - `apply_op` _function_ — Apply ONE journaled op -- the dispatch replay runs per op and a live writer runs after its
 - `apply_wires` _function_ — The generic replay handler for wire-carrying ops (the single wires-replay authority).
 - `composed_replay_handlers` _function_ — Union every installed core's replay registry (DEC 426658f1 — the d066826a fix).
 - `genesis_export` _function_ — One-time whole-db GENESIS BASELINE: journal every node + edge as genesis ops.
 - `graph_writer` _function_ — The write order on a workflow graph (design detail 65f4a6c9): a JournalWriter whose cursors
-- `journal_extend` _function_ — Idempotent extend + journal the DELTA — the pipeline-write append-through.
+- `journal_extend` _function_ — Idempotent extend + journal the DELTA — the pipeline-write append-through, on the write
 - `replay_journal` _function_ — Re-apply every journaled op in append order — the db-from-journal rebuild.
 - `sidecar_journal_path` _function_ — The db's sidecar journal path (DEC ccbab9f5 point 3: placement is per-workflow,
 - `wires_handlers` _function_ — Convenience registry: every named verb replays via `apply_wires`.
+- `workflow_handlers` _function_ — The workflow lane's replay registry (ruling 6683f49e (2)): the composed union, checked
 
 ### `cjm_context_graph_layer.ops`
 
+- `ExtendPlan` _class_ — What an extend would write, read off the graph and written nowhere (ruling 6683f49e (1)):
 - `ExtendResult` _class_ — Outcome of one idempotent extend_graph commit.
 - `GraphCursorStore` _class_ — A graph store's applied cursors as a writer's CursorStore (design detail 65f4a6c9 (2c)): the
 - `GraphIntegrityError` _class_ — An emitted node collided with an existing node of different identity content.
@@ -97,12 +105,16 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `node_identity_mismatch` _function_ — Verify-if-present check: label + sources content-hash set must match.
 - `observe_writes` _function_ — Collect every storage write made inside the block, one record per write:
 - `partition_by_presence` _function_ — Split wire dicts into absent (to add) and present (to verify).
+- `plan_extend` _function_ — The read half of `extend_graph`: one batched presence check per kind. Present nodes are
 - `stamp_op_time` _function_ — Stamp the op clock's time onto an element about to be added — the one function live
 - `store_covariates` _function_ — The store half of the instrument's growth covariates (design detail 681604c1): the nodes,
 
 ### `cjm_context_graph_layer.rebuild`
 
+- `AdoptRefusal` _class_ — An adoption refused: the live db is not the journal's projection, or the drop list does not
 - `GraphStore` _class_ — A started graph: the queue + the capability id to address it.
+- `adopt_db` _function_ — THE ADOPTION (ruling 6683f49e (4), a verb by e35be447): a db written before its applied
+- `adopt_main` _function_ — The `cjm-workflow-adopt` console entrypoint -- a live workflow db adopts its journal
 - `diff_dbs` _function_ — Compare two workflow dbs element for element, both read-only, streamed side by side.
 - `diff_main` _function_ — The `cjm-workflow-diff` console entrypoint — two existing workflow dbs, compared
 - `main` _function_ — The `cjm-workflow-rebuild` console entrypoint — one command, fresh db from journal.

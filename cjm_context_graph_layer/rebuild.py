@@ -23,15 +23,17 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Sequence
 
-from cjm_context_graph_primitives.journal import journal_segments
+from cjm_context_graph_primitives.journal import family_lock, journal_segments
+from cjm_context_graph_primitives.writer import family_name
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 
 from .graphdiff import (Attribution, diff_stores, LagAttribution, MarkAttribution, PAGE,
                         render_diff, STREAM_HISTORY)
-from .journal import composed_replay_handlers, replay_journal
+from .journal import replay_journal, workflow_handlers
+from .ops import graph_task, GraphCursorStore
 
 # The op clock's landing in the workflow writers (build 78a60b1a, design 8f6f2343): the
 # correction, decomp, transcription cores and this layer took it in one commit each at
@@ -99,16 +101,18 @@ async def rebuild_db(
     journal_path: str,      # The journal's live-tail path (segment family resolved from it)
     manifests_dir: str,     # Capability manifests directory (workspace or explicit)
     graph_capability: str = "cjm-capability-graph-sqlite",  # Graph-storage capability name
-    handlers: Optional[Dict[str, Any]] = None,  # Override registry (None = composed union)
+    handlers: Optional[Mapping[str, Any]] = None,  # Override registry (None = the workflow lane's, its declared registries checked)
 ) -> Dict[str, int]:  # replay_journal's counts: genesis adds/verifies + per-verb tallies
     """Rebuild `db_path` from the journal — substrate standup + composed replay.
 
     Idempotent end to end: genesis ops verify-collide, wire ops re-extend,
-    `session-status` replays last-wins."""
+    `session-status` replays last-wins. The replay stamps the db's applied cursor at its close
+    (design detail 65f4a6c9 (2c), ruling 6683f49e (3)), so a rebuilt db takes writes at once and
+    a heal of a live one leaves its cursor current."""
     async with open_store(db_path, manifests_dir, graph_capability) as gx:
         return await replay_journal(gx.queue, gx.graph_id, journal_path,
-                                    handlers=handlers if handlers is not None
-                                    else composed_replay_handlers())
+                                    handlers=handlers if handlers is not None else workflow_handlers(),
+                                    cursors=GraphCursorStore(gx.queue, gx.graph_id))
 
 
 async def diff_dbs(
@@ -126,6 +130,76 @@ async def diff_dbs(
                        max_history=STREAM_HISTORY) as gb:
         res = await diff_stores(ga, gb, attribution=attribution, page=page)
     return {**res, "a": db_a, "b": db_b}
+
+
+class AdoptRefusal(RuntimeError):
+    """An adoption refused: the live db is not the journal's projection, or the drop list does not
+    name exactly the elements only the live db holds. Nothing was written."""
+
+
+async def adopt_db(
+    db_path: str,           # The LIVE graph db to adopt
+    journal_path: str,      # The journal's live-tail path (segment family resolved from it)
+    manifests_dir: str,     # Capability manifests directory
+    scratch_path: str,      # A FRESH db path the journal replays into (the proof's other side)
+    drop: Optional[Sequence[str]] = None,  # Element ids to delete from live: must equal the live-only list EXACTLY
+    graph_capability: str = "cjm-capability-graph-sqlite",  # Graph-storage capability name
+    handlers: Optional[Mapping[str, Any]] = None,  # Override registry (None = the workflow lane's)
+    keep_scratch: bool = False,  # Keep the scratch db after the proof (default: removed)
+) -> Dict[str, Any]:  # {family, cursor, prior, dropped, diff}
+    """THE ADOPTION (ruling 6683f49e (4), a verb by e35be447): a db written before its applied
+    cursor existed -- or whose cursor a rewrite left behind -- adopts its journal family's end only
+    once a replay of the family REPRODUCES it. Under the family's lock (no writer appends
+    meanwhile): the journal replays into the scratch db (its cursor stamped at the replay's end),
+    which is compared with the live db element for element (f8b9c728's comparator, the lane's
+    attribution). CLEAN -> the replayed end becomes the live cursor. Elements ONLY IN LIVE (written
+    unjournaled) -> refused, every one listed; `drop` naming exactly that list deletes them, then
+    stamps. Any other difference -- a journaled element live lacks, a field that differs --
+    refuses: that db is not the journal's projection, and the remedy is a rebuild. Stamping
+    without the proof is rejected: a cursor over a db the journal does not reproduce makes every
+    later proof carry the delta."""
+    if Path(scratch_path).exists():
+        raise AdoptRefusal(f"adopt: the scratch db must be a FRESH path: {scratch_path}")
+    family = family_name(journal_path)
+    try:
+        async with family_lock(journal_path):
+            await rebuild_db(scratch_path, journal_path, manifests_dir, graph_capability, handlers)
+            async with open_store(db_path, manifests_dir, graph_capability,
+                                  max_history=STREAM_HISTORY) as live, \
+                    open_store(scratch_path, manifests_dir, graph_capability, readonly=True,
+                               max_history=STREAM_HISTORY) as scratch:
+                res = await diff_stores(live, scratch, attribution=WORKFLOW_ATTRIBUTION, collect=True)
+                res = {**res, "a": db_path, "b": scratch_path}
+                n, e = res["nodes"], res["edges"]
+                other = sum(k["only_b"]["count"] + k["differing"] for k in (n, e))
+                if other:
+                    raise AdoptRefusal(f"adopt: {db_path} is not the projection of {family} -- "
+                                       f"{other} difference(s) beyond elements only live holds; "
+                                       f"rebuild it instead\n{render_diff(res)}")
+                live_nodes, live_edges = n["only_a"]["ids"], e["only_a"]["ids"]
+                live_only = sorted(live_nodes + live_edges)
+                if sorted(drop or []) != live_only:
+                    raise AdoptRefusal(
+                        f"adopt: {len(live_only)} element(s) only the live db holds (written "
+                        f"unjournaled); --drop must name exactly these"
+                        + (f", and names {sorted(set(drop or []) - set(live_only))} besides"
+                           if set(drop or []) - set(live_only) else "")
+                        + "".join(f"\n  {i}" for i in live_only))
+                if live_edges:
+                    await graph_task(live.queue, live.graph_id, "delete_edges", edge_ids=live_edges)
+                if live_nodes:
+                    await graph_task(live.queue, live.graph_id, "delete_nodes", node_ids=live_nodes,
+                                     cascade=False)
+                live_cursors = GraphCursorStore(live.queue, live.graph_id)
+                prior = await live_cursors.read(family)
+                end = await GraphCursorStore(scratch.queue, scratch.graph_id).read(family)
+                await live_cursors.record(family, end)
+    finally:
+        if not keep_scratch:
+            for suffix in ("", "-wal", "-shm"):
+                Path(scratch_path + suffix).unlink(missing_ok=True)
+    return {"family": family, "cursor": end.to_dict(), "prior": prior.to_dict() if prior else None,
+            "dropped": live_only, "diff": res}
 
 
 def main(argv: Optional[List[str]] = None) -> int:  # Process exit code (3 = the proof found differences)
@@ -186,3 +260,33 @@ def diff_main(argv: Optional[List[str]] = None) -> int:  # Process exit code (3 
                                graph_capability=args.graph_capability, page=args.page))
     print(render_diff(res, args.format))
     return 0 if res["clean"] else 3
+
+
+def adopt_main(argv: Optional[List[str]] = None) -> int:  # Process exit code (3 = refused)
+    """The `cjm-workflow-adopt` console entrypoint -- a live workflow db adopts its journal
+    family's end once a replay reproduces it (`adopt_db`). Every path REQUIRED-EXPLICIT;
+    `--drop` names the live-only elements a refusal listed, all of them."""
+    parser = argparse.ArgumentParser(
+        prog="cjm-workflow-adopt",
+        description="Adopt a workflow db's journal cursor, proven by a replay (element for element).")
+    parser.add_argument("--db", required=True, help="The LIVE db to adopt")
+    parser.add_argument("--journal", required=True, help="Journal live-tail path")
+    parser.add_argument("--manifests-dir", required=True, help="Capability manifests directory")
+    parser.add_argument("--scratch", required=True, help="A FRESH db path the journal replays into")
+    parser.add_argument("--drop", nargs="+", default=None, metavar="ID",
+                        help="Delete these live-only elements first: exactly the list a refusal printed")
+    parser.add_argument("--keep-scratch", action="store_true", help="Keep the scratch db afterwards")
+    parser.add_argument("--graph-capability", default="cjm-capability-graph-sqlite",
+                        help="Graph-storage capability name (default: %(default)s)")
+    args = parser.parse_args(argv)
+    try:
+        res = asyncio.run(adopt_db(args.db, args.journal, args.manifests_dir, args.scratch,
+                                   drop=args.drop, graph_capability=args.graph_capability,
+                                   keep_scratch=args.keep_scratch))
+    except AdoptRefusal as e:
+        print(f"REFUSED: {e}")
+        return 3
+    print(f"adopted {res['family']}: cursor {res['cursor']} (prior {res['prior']}); "
+          f"dropped {len(res['dropped'])} live-only element(s)")
+    print(render_diff(res["diff"]))
+    return 0

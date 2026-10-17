@@ -401,6 +401,57 @@ class ExtendResult:
     added_edge_ids: List[str] = field(default_factory=list)  # Ids of created edges
 
 
+@dataclass
+class ExtendPlan:
+    """What an extend would write, read off the graph and written nowhere (ruling 6683f49e (1)):
+    the ABSENT wires, stamped with the op clock's time, and the present ones' counts."""
+
+    nodes: List[Dict[str, Any]] = field(default_factory=list)  # Absent node wires (to add)
+    edges: List[Dict[str, Any]] = field(default_factory=list)  # Absent edge wires (to add)
+    nodes_verified: int = 0   # Nodes already present, identity-verified
+    edges_existing: int = 0   # Edges already present
+
+    def result(self) -> "ExtendResult":  # The extend's outcome once the absent wires are added
+        return ExtendResult(nodes_added=len(self.nodes), nodes_verified=self.nodes_verified,
+                            edges_added=len(self.edges), edges_existing=self.edges_existing,
+                            added_node_ids=[n["id"] for n in self.nodes],
+                            added_edge_ids=[e["id"] for e in self.edges])
+
+
+async def plan_extend(
+    queue: JobQueue,              # Started job queue
+    graph_id: str,                # Graph-storage capability id
+    nodes: List[Dict[str, Any]],  # Node wire dicts
+    edges: List[Dict[str, Any]],  # Edge wire dicts
+) -> ExtendPlan:  # The absent wires (stamped) + the present counts
+    """The read half of `extend_graph`: one batched presence check per kind. Present nodes are
+    verified against the new emission (label + provenance content hashes; a mismatch raises
+    `GraphIntegrityError` LOUDLY); absent wires are stamped with the op clock's time (an open
+    window's ts -- replay, or a live write unit -- so a journaled plan carries the time its apply
+    and its replay will stamp; a carried stamp is kept, an explicit None absent: `stamp_op_time`).
+    Writes nothing."""
+    plan = ExtendPlan()
+    ts = PROVENANCE_TS.get()
+    if nodes:
+        res = await graph_task(queue, graph_id, "query_nodes",
+                               query=NodeQuery(ids=[n["id"] for n in nodes]).to_dict())
+        existing = {gn.id: gn for gn in (res.nodes or [])}
+        absent, present = partition_by_presence(nodes, set(existing))
+        for n in present:
+            msg = node_identity_mismatch(existing[n["id"]], n)
+            if msg:
+                raise GraphIntegrityError(f"node {n['id']}: {msg}")
+        plan.nodes_verified = len(present)
+        plan.nodes = [stamp_op_time(n, ts) for n in absent]
+    if edges:
+        eres = await graph_task(queue, graph_id, "query_edges",
+                                query=EdgeQuery(ids=[e["id"] for e in edges], project=["id"]).to_dict())
+        existing_eids = {r["id"] for r in (eres.rows or [])}
+        plan.edges = [stamp_op_time(e, ts) for e in edges if e["id"] not in existing_eids]
+        plan.edges_existing = len(edges) - len(plan.edges)
+    return plan
+
+
 async def extend_graph(
     queue: JobQueue,              # Started job queue
     graph_id: str,                # Graph-storage capability id
@@ -415,43 +466,18 @@ async def extend_graph(
     content hashes) and a mismatch raises `GraphIntegrityError` LOUDLY; absent
     nodes/edges are added. Cache-hit re-emission therefore collides into a
     verified no-op (stress item 4), and a re-derived spine reproduces — never
-    duplicates — its layer-0 (stress item 1).
+    duplicates — its layer-0 (stress item 1). The reads are `plan_extend`; inside
+    an op clock window (replay, or a live write unit) what is added carries its ts,
+    so live and rebuild agree (0d50b921, design 8f6f2343).
     """
-    result = ExtendResult()
-    # The op clock (0d50b921, design 8f6f2343): inside a window — replay, or a live
-    # write unit — stamp its ts onto everything ADDED, so live and rebuild agree.
-    # A carried stamp is kept, an explicit None is absent (`stamp_op_time`); outside a
-    # window, capability now().
-    ts = PROVENANCE_TS.get()
-
-    if nodes:
-        res = await graph_task(queue, graph_id, "query_nodes",
-                               query=NodeQuery(ids=[n["id"] for n in nodes]).to_dict())
-        existing = {gn.id: gn for gn in (res.nodes or [])}
-        absent, present = partition_by_presence(nodes, set(existing))
-        for n in present:
-            msg = node_identity_mismatch(existing[n["id"]], n)
-            if msg:
-                raise GraphIntegrityError(f"node {n['id']}: {msg}")
-        result.nodes_verified = len(present)
-        if absent:
-            for n in absent:
-                stamp_op_time(n, ts)
-            added = await graph_task(queue, graph_id, "add_nodes", nodes=absent)
-            result.added_node_ids = list(added or [])
-            result.nodes_added = len(result.added_node_ids)
-
-    if edges:
-        eres = await graph_task(queue, graph_id, "query_edges",
-                                query=EdgeQuery(ids=[e["id"] for e in edges], project=["id"]).to_dict())
-        existing_eids = {r["id"] for r in (eres.rows or [])}
-        absent_edges = [e for e in edges if e["id"] not in existing_eids]
-        result.edges_existing = len(edges) - len(absent_edges)
-        if absent_edges:
-            for e in absent_edges:
-                stamp_op_time(e, ts)
-            added = await graph_task(queue, graph_id, "add_edges", edges=absent_edges)
-            result.added_edge_ids = list(added or [])
-            result.edges_added = len(result.added_edge_ids)
-
+    plan = await plan_extend(queue, graph_id, nodes, edges)
+    result = ExtendResult(nodes_verified=plan.nodes_verified, edges_existing=plan.edges_existing)
+    if plan.nodes:
+        added = await graph_task(queue, graph_id, "add_nodes", nodes=plan.nodes)
+        result.added_node_ids = list(added or [])
+        result.nodes_added = len(result.added_node_ids)
+    if plan.edges:
+        added = await graph_task(queue, graph_id, "add_edges", edges=plan.edges)
+        result.added_edge_ids = list(added or [])
+        result.edges_added = len(result.added_edge_ids)
     return result

@@ -161,10 +161,14 @@ class _Bucket:
     """The differences one cause (or drift) holds for one kind: one-sided ids by class, the
     count of shared ids differing, and per (class, field) a count with samples."""
 
-    def __init__(self, kind: str):
+    def __init__(self, kind: str, collect: bool = False):
         self.kind = kind
+        self.collect = collect  # Keep EVERY one-sided id (`ids`), not only the sample
         self.sides = {"only_a": {"count": 0, "by_class": {}, "sample": []},
                       "only_b": {"count": 0, "by_class": {}, "sample": []}}
+        if collect:
+            for s in self.sides.values():
+                s["ids"] = []
         self.differing = 0
         self.rows: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
@@ -174,6 +178,8 @@ class _Bucket:
         s["by_class"][cls] = s["by_class"].get(cls, 0) + 1
         if len(s["sample"]) < SAMPLES_PER_FIELD:
             s["sample"].append(eid)
+        if self.collect:
+            s["ids"].append(eid)
 
     def fields(self, eid: str, cls: str, fields: List[Tuple[str, Any, Any]]) -> None:
         self.differing += 1
@@ -203,19 +209,21 @@ class KindDiff:
         kind: str,                                   # "node" | "edge"
         path_map: Sequence[Tuple[str, str]] = (),    # (old prefix, new prefix) path rewrites
         attribution: Sequence[Attribution] = (),     # The lane's known causes, in precedence order
+        collect: bool = False,                       # Keep every one-sided id, not only a sample (an adoption's exact drop list)
     ):
         self.kind = kind
+        self.collect = collect
         self.class_of, self.structural = KINDS[kind]
         self.path_map = list(path_map)
         self.by_id = [a for a in attribution if isinstance(a, IdAttribution)]
         self.by_field = [a for a in attribution if not isinstance(a, IdAttribution)]
         self.names = [a.name for a in attribution]
-        self.buckets: Dict[Optional[str], _Bucket] = {DRIFT: _Bucket(kind)}
+        self.buckets: Dict[Optional[str], _Bucket] = {DRIFT: _Bucket(kind, collect)}
         self.count_a = self.count_b = 0
 
     def _bucket(self, name: Optional[str]) -> _Bucket:
         if name not in self.buckets:
-            self.buckets[name] = _Bucket(self.kind)
+            self.buckets[name] = _Bucket(self.kind, self.collect)
         return self.buckets[name]
 
     def _id_cause(self, w: Dict[str, Any]) -> Optional[str]:
@@ -397,11 +405,13 @@ async def diff_stores(
     path_map: Optional[Sequence[Tuple[str, str]]] = None,  # (old prefix, new prefix) path rewrites
     attribution: Sequence[Attribution] = (),  # The lane's known causes
     page: int = PAGE,                          # Elements per keyset page
+    collect: bool = False,                     # Keep every one-sided id (each side's `ids`), not only a sample
 ) -> Dict[str, Any]:  # {nodes, edges, clean, attributed}
-    """Compare two graphs element for element, streamed: O(page) memory per side."""
+    """Compare two graphs element for element, streamed: O(page) memory per side (plus, with
+    `collect`, the one-sided ids -- an adoption's drop list must name every one)."""
     out = []
     for kind in ("node", "edge"):
-        d = KindDiff(kind, path_map or (), attribution)
+        d = KindDiff(kind, path_map or (), attribution, collect)
         async for wa, wb in amerge_sorted(stream_elements(ga, kind, page),
                                           stream_elements(gb, kind, page)):
             d.add(wa, wb)

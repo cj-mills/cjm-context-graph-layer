@@ -8,22 +8,33 @@ own verb handlers on replay (replay stays DOMAIN-OWNED); the op envelope + appen
 discipline live in `cjm_context_graph_primitives.journal`.
 """
 
+import functools
 import time
+from contextlib import nullcontext
 from importlib.metadata import entry_points
-from typing import Any, Callable, Dict, List, Optional
+from types import MappingProxyType
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from cjm_context_graph_primitives.journal import append_op, op_clock, read_journal
+from cjm_context_graph_primitives.journal import append_op, family_lock, op_clock, read_journal
 from cjm_context_graph_primitives.query import EdgeQuery, NodeQuery
 from cjm_context_graph_primitives.timings import record_replay, record_series, span, timed
-from cjm_context_graph_primitives.writer import JournalWriter
+from cjm_context_graph_primitives.writer import (CursorMismatch, CursorStore, family_name,
+                                                 JournalWriter, ORIGIN, read_tail)
 
-from .ops import (extend_graph, ExtendResult, graph_task, GraphCursorStore, PROVENANCE_TS,
-                  stamp_op_time)
+from .ops import (extend_graph, ExtendResult, graph_task, GraphCursorStore, plan_extend,
+                  PROVENANCE_TS, stamp_op_time)
 
 GENESIS_NODE = "genesis-node"  # One node's whole-db baseline op (args = the node wire dict)
 GENESIS_EDGE = "genesis-edge"  # One edge's whole-db baseline op (args = the edge wire dict)
 _SCAN_LIMIT = 10_000_000       # Explicit whole-graph read limit (the full_graph_view recipe)
 REPLAY_GROUP = "cjm_context_graph_layer.replay"  # Entry-point group each core's registry factory joins
+# THE WORKFLOW LANE'S DECLARED REGISTRIES (ruling 6683f49e (2)): every core that journals onto the
+# shared workflow journal, by its REPLAY_GROUP entry-point name -> the distribution that installs it.
+# A writer opening on the lane needs them all: an env missing one could not apply (heal) or replay
+# (rebuild) that core's ops.
+WORKFLOW_REGISTRIES = {"correction": "cjm-transcript-correction-core",
+                       "decomp": "cjm-transcript-decomp-core",
+                       "transcription": "cjm-transcription-core"}
 
 
 async def genesis_export(
@@ -87,27 +98,16 @@ async def apply_op(
     return verb
 
 
-@timed("replay_journal")
-async def replay_journal(
+async def _replay_records(
     queue: Any,         # Started job queue
     graph_id: str,      # Graph-storage capability id
-    journal_path: str,  # Sidecar journal path
-    handlers: Optional[Dict[str, Callable[..., Any]]] = None,  # Domain verb -> async handler(queue, graph_id, op)
-    batch: int = 500,   # extend_graph flush size for genesis ops
-    offset: int = 0,    # Skip the first N ops: a delta replay of the journal's tail (idempotent)
+    journal_path: str,  # The family the records came from (the instrument's key)
+    records: List[Dict[str, Any]],  # The records to apply, in append order
+    handlers: Mapping[str, Callable[..., Any]],  # Domain verb -> async handler(queue, graph_id, op)
+    batch: int,         # extend_graph flush size for genesis ops
+    start: int,         # The family position of the first record (the instrument's series index)
 ) -> Dict[str, int]:  # Genesis add/verify counts + a count per handled domain verb
-    """Re-apply every journaled op in append order — the db-from-journal rebuild.
-
-    Genesis ops flush through `extend_graph` in batches, so replay is IDEMPOTENT:
-    onto a fresh db everything adds; onto a live one, present nodes verify and
-    collide into no-ops (the M3 convergence semantics). Domain verbs dispatch to
-    their registered handler — replay stays DOMAIN-OWNED (DEC ccbab9f5 point 1) —
-    and pending genesis batches flush BEFORE a handler runs, so every op sees its
-    predecessors applied. An unregistered verb raises LOUDLY: silently skipping an
-    op would rebuild a db missing knowledge the journal holds. Temporal provenance
-    rides the replay (0d50b921): genesis args carry their op's journaled ts, and
-    the PROVENANCE_TS window is open around every domain handler."""
-    handlers = handlers or {}
+    """`replay_journal`'s apply pass over records already read."""
     counts: Dict[str, int] = {"nodes_added": 0, "nodes_verified": 0,
                               "edges_added": 0, "edges_existing": 0}
     pending_nodes: List[Dict[str, Any]] = []
@@ -124,9 +124,7 @@ async def replay_journal(
             pending_nodes.clear()
             pending_edges.clear()
 
-    for position, op in enumerate(read_journal(journal_path)):
-        if position < offset:
-            continue
+    for position, op in enumerate(records, start=start):
         record_replay(journal_path, op)  # the replay's logical size (ruling 9af0e42e (3))
         verb = op.get("verb", "")
         if verb in (GENESIS_NODE, GENESIS_EDGE):
@@ -150,6 +148,59 @@ async def replay_journal(
         if len(pending_nodes) + len(pending_edges) >= batch:
             await flush()
     await flush()
+    return counts
+
+
+@timed("replay_journal")
+async def replay_journal(
+    queue: Any,         # Started job queue
+    graph_id: str,      # Graph-storage capability id
+    journal_path: str,  # Sidecar journal path
+    handlers: Optional[Mapping[str, Callable[..., Any]]] = None,  # Domain verb -> async handler(queue, graph_id, op)
+    batch: int = 500,   # extend_graph flush size for genesis ops
+    offset: int = 0,    # Skip the first N ops: a delta replay of the journal's tail (idempotent)
+    cursors: Optional[CursorStore] = None,  # The db's applied cursors: stamped at the replay's close (None = none kept)
+) -> Dict[str, int]:  # Genesis add/verify counts + a count per handled domain verb
+    """Re-apply every journaled op in append order — the db-from-journal rebuild.
+
+    Genesis ops flush through `extend_graph` in batches, so replay is IDEMPOTENT:
+    onto a fresh db everything adds; onto a live one, present nodes verify and
+    collide into no-ops (the M3 convergence semantics). Domain verbs dispatch to
+    their registered handler — replay stays DOMAIN-OWNED (DEC ccbab9f5 point 1) —
+    and pending genesis batches flush BEFORE a handler runs, so every op sees its
+    predecessors applied. An unregistered verb raises LOUDLY: silently skipping an
+    op would rebuild a db missing knowledge the journal holds. Temporal provenance
+    rides the replay (0d50b921): genesis args carry their op's journaled ts, and
+    the PROVENANCE_TS window is open around every domain handler.
+
+    THE APPLIED CURSOR (design detail 65f4a6c9 (2c), ruling 6683f49e (3)): the family is read
+    ONCE with each record's position, and with `cursors` the replay stamps the position of the
+    last record it read -- every rebuild leaves the db's cursor current, never past a record it
+    did not apply. A db that already holds a cursor is one a live writer may hold, so the replay
+    takes the family's lock (a fresh build holds none: writes never wait on a build), and an
+    `offset` past the cursor's true place refuses -- the ops between would be skipped."""
+    handlers = handlers or {}
+    family = family_name(journal_path)
+    held = await cursors.read(family) if cursors is not None else None
+    async with (family_lock(journal_path) if held is not None else nullcontext()):
+        with span("read_journal") as measured:  # the instrument (681604c1): a whole-history read
+            tail = read_tail(journal_path, ORIGIN)
+            measured["ops"] = len(tail)
+        if held is not None and held.ordinal:
+            # The cursor's TRUE place, counted off the family -- never its stored ordinal
+            at = next((i + 1 for i, (_, pos) in enumerate(tail)
+                       if (pos.segment, pos.offset, pos.digest) == (held.segment, held.offset, held.digest)),
+                      None)
+            if at is None:
+                raise CursorMismatch(f"{family}: no record ends where the db's cursor stands -- the "
+                                     f"family was rewritten under it; rebuild to re-stamp it")
+            if at < offset:
+                raise RuntimeError(f"replay offset {offset}: the db's cursor stands after record {at} "
+                                   f"-- the {offset - at} op(s) between would be skipped, never applied")
+        counts = await _replay_records(queue, graph_id, journal_path,
+                                       [record for record, _ in tail[offset:]], handlers, batch, offset)
+        if cursors is not None:
+            await cursors.record(family, tail[-1][1] if tail else ORIGIN)
     return counts
 
 
@@ -192,12 +243,21 @@ def graph_writer(
     queue: Any,         # Started job queue
     graph_id: str,      # Graph-storage capability id
     journal_path: str,  # The graph's journal family (its live tail)
-    handlers: Dict[str, Callable[..., Any]],  # Domain verb -> async handler(queue, graph_id, op)
+    handlers: Optional[Mapping[str, Callable[..., Any]]] = None,  # Domain verb -> async handler(queue, graph_id, op); None = the workflow lane's registry
 ) -> JournalWriter:  # `async with` it: lock, heal, then plan and write
     """The write order on a workflow graph (design detail 65f4a6c9): a JournalWriter whose cursors
-    live in the graph store beside the graph and whose applier is replay's own `apply_op`."""
+    live in the graph store beside the graph and whose applier is replay's own `apply_op`. By
+    default the applier dispatches through `workflow_handlers` -- the declared registries checked
+    as the writer opens (ruling 6683f49e (2)). Opened inside an open writer on the same family and
+    graph it joins that writer's unit of work (6683f49e (1))."""
+    handlers = workflow_handlers() if handlers is None else handlers
     return JournalWriter(journal_path, GraphCursorStore(queue, graph_id),
                          lambda op: apply_op(queue, graph_id, op, handlers))
+
+
+class UnjournaledWrite(ValueError):
+    """A write on a journal-sourced graph with no journal path and no explicit `unjournaled=True`
+    (design detail 65f4a6c9 (3)): refused, never silently left out of the source of truth."""
 
 
 async def journal_extend(
@@ -205,44 +265,56 @@ async def journal_extend(
     graph_id: str,                # Graph-storage capability id
     nodes: List[Dict[str, Any]],  # Node wire dicts to extend with
     edges: List[Dict[str, Any]],  # Edge wire dicts to extend with
-    journal_path: Optional[str] = None,  # Sidecar journal — append the DELTA op on success (None = unjournaled)
-    verb: str = "graph-extend",   # Domain verb for the journaled op
+    journal_path: Optional[str] = None,  # Sidecar journal -- the DELTA op is journaled, then applied (None refuses unless `unjournaled`)
+    verb: str = "graph-extend",   # Domain verb for the journaled op (its replay handler is the apply)
     actor: str = "",              # Who produced the wires (e.g. "pipeline:cjm-transcription-core")
     run: Optional[str] = None,    # Run id — pins the run manifest (derivation identity, DEC ccbab9f5 pt 8)
     args: Optional[Dict[str, Any]] = None,  # Small semantic summary for the op (the dataset row)
+    unjournaled: bool = False,    # Explicitly write with no journal (scratch builds, tests, ingest's own build)
+    handlers: Optional[Mapping[str, Callable[..., Any]]] = None,  # Replay registry for the apply (None = the workflow lane's)
 ) -> ExtendResult:  # The extend result (adds + verified counts)
-    """Idempotent extend + journal the DELTA — the pipeline-write append-through.
+    """Idempotent extend + journal the DELTA — the pipeline-write append-through, on the write
+    order (design detail 65f4a6c9, ruling 6683f49e (1)).
 
-    Journals ONLY the wires this call actually ADDED: verified-present wires were
-    added by an earlier journaled op (or the genesis baseline), so re-runs over
-    cached content collide into verified no-ops AND leave the journal untouched —
-    the Derivation no-spam principle applied to the write journal. Appends ride
-    the bulk lane (fresh deterministic ids collide at REPLAY, not append time).
-    One op clock window spans the extend and the append (design 8f6f2343): what the
-    extend adds carries the op's ts, exactly as its replay will stamp it."""
+    PLANS by presence (`plan_extend`): every wire already present is no change and journals
+    nothing (17daa86b) -- re-runs over cached content collide into verified no-ops and leave the
+    journal untouched (the Derivation no-spam principle). Otherwise the ABSENT wires' op is
+    APPENDED, then APPLIED through the replay's own handler for `verb`, and the db's cursor
+    advanced -- under the family's writer, which an enclosing writer (an app's gesture window)
+    is joined by. One op clock window spans the plan and the write (design 8f6f2343): the
+    journaled wires carry the op's ts, exactly as the apply and a replay stamp them.
+
+    Nothing writes a journal-sourced graph unjournaled by default (65f4a6c9 (3)): with no
+    `journal_path` the call refuses unless `unjournaled=True`, which extends with no op."""
+    if not journal_path:
+        if not unjournaled:
+            raise UnjournaledWrite(
+                f"journal_extend ({verb}): no journal path -- a journal-sourced graph is never "
+                f"written unjournaled by default; pass unjournaled=True for a scratch build or a "
+                f"test (design detail 65f4a6c9 (3))")
+        with op_clock():
+            return await extend_graph(queue, graph_id, nodes, edges)
     with op_clock():
         return await _journal_extend(queue, graph_id, nodes, edges, journal_path,
-                                     verb, actor, run, args)
+                                     verb, actor, run, args, handlers)
 
 
 async def _journal_extend(
     queue: Any, graph_id: str, nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]],
-    journal_path: Optional[str], verb: str, actor: str, run: Optional[str],
-    args: Optional[Dict[str, Any]],
+    journal_path: str, verb: str, actor: str, run: Optional[str],
+    args: Optional[Dict[str, Any]], handlers: Optional[Mapping[str, Callable[..., Any]]],
 ) -> ExtendResult:  # The extend result (adds + verified counts)
-    """`journal_extend`'s body, run inside its op clock window."""
-    res = await extend_graph(queue, graph_id, nodes, edges)
-    if journal_path and (res.nodes_added or res.edges_added):
-        added_n = set(res.added_node_ids)
-        added_e = set(res.added_edge_ids)
-        op: Dict[str, Any] = {"verb": verb, "actor": actor,
-                              "args": dict(args or {}),
-                              "wires": {"nodes": [n for n in nodes if n["id"] in added_n],
-                                        "edges": [e for e in edges if e["id"] in added_e]}}
-        if run:
-            op["run"] = run
-        append_op(journal_path, op, dedup=False)
-    return res
+    """`journal_extend`'s journaled body, run inside its op clock window: plan -> append ->
+    apply -> advance under the family's writer (joining an enclosing one)."""
+    async with graph_writer(queue, graph_id, journal_path, handlers) as w:
+        plan = await plan_extend(queue, graph_id, nodes, edges)
+        if plan.nodes or plan.edges:
+            op: Dict[str, Any] = {"verb": verb, "actor": actor, "args": dict(args or {}),
+                                  "wires": {"nodes": plan.nodes, "edges": plan.edges}}
+            if run:
+                op["run"] = run
+            await w.write(op, dedup=False)
+        return plan.result()
 
 
 def composed_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(queue, graph_id, op)
@@ -268,3 +340,28 @@ def composed_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(queue
             handlers[verb] = handler
             owners[verb] = ep.name
     return handlers
+
+
+class MissingRegistry(RuntimeError):
+    """The env lacks a replay registry the workflow lane declares: refused when a writer opens,
+    naming the core to install -- never at the first op only that core can apply."""
+
+
+@functools.lru_cache(maxsize=None)
+def workflow_handlers() -> Mapping[str, Any]:  # verb -> async handler(queue, graph_id, op), read-only
+    """The workflow lane's replay registry (ruling 6683f49e (2)): the composed union, checked
+    against the DECLARED registries the shared workflow journal needs (`WORKFLOW_REGISTRIES`) and
+    cached per process -- a writer opens per write, the entry-point scan runs once. A missing
+    registry refuses here, naming the core to install: never later, at the first op only that
+    core can apply (a heal after a crash), and never as an env that silently cannot rebuild.
+    Read-only, since one mapping serves every writer of the process."""
+    installed = {ep.name for ep in entry_points(group=REPLAY_GROUP)}
+    missing = [f"{name} ({dist})" for name, dist in WORKFLOW_REGISTRIES.items()
+               if name not in installed]
+    if missing:
+        raise MissingRegistry(
+            f"workflow_handlers: this env lacks the workflow lane's replay registr"
+            f"{'y' if len(missing) == 1 else 'ies'} {', '.join(missing)} -- install the core into "
+            f"it (an env per role, ruling 80685121): a writer here could neither heal nor rebuild "
+            f"the shared workflow journal")
+    return MappingProxyType(composed_replay_handlers())

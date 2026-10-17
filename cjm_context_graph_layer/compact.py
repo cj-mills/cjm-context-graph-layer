@@ -36,10 +36,11 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
-from cjm_context_graph_primitives.journal import (journal_segments, read_segment, rotate_journal,
-                                                  write_segment)
+from cjm_context_graph_primitives.journal import (family_lock_sync, journal_segments, read_segment,
+                                                  rotate_journal, write_segment)
+from cjm_context_graph_primitives.writer import JournalWriter
 
 from .journal import GENESIS_EDGE, GENESIS_NODE
 
@@ -112,6 +113,24 @@ class CompactReport:
                 f"retired ids seen {self.retired_ids_seen}/{self.retired_ids_requested}"
                 + (f"; archive {self.archive_path}" if self.archive_path else "")
                 + (f"; {len(self.dangling)} DANGLING reference(s) — a live run would refuse" if self.dangling else ""))
+
+
+@dataclass
+class CompactionPlan:
+    """A compaction scanned and resolved, nothing written (ruling 6683f49e (3)): what moves, where
+    it lands, and each changed segment's kept lines -- so the ops that delete the moved wires from
+    the db can be journaled and applied BEFORE the storage move."""
+
+    report: CompactReport                    # The scan's counts (the move fills in its own)
+    archive_dir: str                         # Where the archive segment lands
+    archive_path: str                        # The archive segment the move will write (resolved here)
+    archived_lines: List[str] = field(default_factory=list)  # The archive segment's lines
+    rewrites: Dict[str, Tuple[List[str], Tuple[int, float]]] = field(default_factory=dict)  # seg -> (kept lines, (size, mtime) at scan)
+    segments: List[str] = field(default_factory=list)        # The segments scanned
+
+    @property
+    def moves(self) -> bool:  # True when the move would write anything
+        return bool(self.archived_lines)
 
 
 def _stem(journal_path: str) -> str:  # "context_graph.writes" for ".../context_graph.writes.jsonl"
@@ -194,37 +213,30 @@ def _kept_reference_text(op: Dict[str, Any]) -> str:
     return json.dumps(op, sort_keys=True)
 
 
-def compact_journal(
+def plan_compaction(
     journal_path: str,          # The journal's live-tail path (the family is resolved from it)
-    archive_dir: str,           # Archive directory (created); MUST lie outside the backup mirror's globs
+    archive_dir: str,           # Archive directory; MUST lie outside the backup mirror's globs
     retired_ids: Iterable[str], # Node ids whose wires move (edges touching them move too)
     *,
     label: str,                 # What this compaction is (rides the manifest + split-op markers)
-    dry_run: bool = False,      # Scan + report; write nothing, rotate nothing
-    actor: str = "",            # Who ran it (manifest attribution)
-) -> CompactReport:
-    """Move every wire on the retired ids out of the journal family into ONE new archive segment.
-
-    Order of operations on a live run: rotate the tail (invariant 3) -> scan every cold
-    segment, classifying ops and collecting dangling references -> REFUSE if any kept
-    op names a retired id (invariant 1; deletes exempt) -> write the archive segment +
-    manifest -> rewrite each changed segment atomically (tmp + os.replace), refusing if
-    its size/mtime moved since the scan. A dry run performs the scan only and reports
-    the dangling references instead of refusing.
-    """
+    dry_run: bool = False,      # Report the dangling references instead of refusing; may read the tail
+) -> CompactionPlan:
+    """THE SCAN: classify every op of the family's cold segments -- moved whole, split, kept --
+    collect the dangling references, and REFUSE if any kept op names a retired id (invariant 1;
+    deletes exempt) before anything is written. Writes nothing and never rotates: a live caller
+    rotates first, under the family's lock, so every target sits in a cold segment (invariant 3);
+    a dry run may READ the tail, to count what a rotation would expose."""
     retired: Set[str] = {str(i) for i in retired_ids}
     report = CompactReport(label=label, dry_run=dry_run, journal_path=journal_path,
                            retired_ids_requested=len(retired))
+    plan = CompactionPlan(report=report, archive_dir=archive_dir,
+                          archive_path=next_archive_path(journal_path, archive_dir))
     if not retired:
-        return report
-    if not dry_run:
-        rotate_journal(journal_path)  # close the tail: targets now sit in immutable cold segments
+        return plan
     segments = [s for s in journal_segments(journal_path) if s != journal_path]  # never the live tail
     if dry_run and Path(journal_path).exists():
-        segments.append(journal_path)  # a dry run may READ the tail to count what a rotation would expose
-
-    archived_lines: List[str] = []
-    rewrites: Dict[str, Tuple[List[str], Tuple[int, float]]] = {}  # seg -> (kept lines, (size, mtime) at scan)
+        segments.append(journal_path)
+    plan.segments = segments
     seen: Set[str] = set()
     t_scan = time.perf_counter()
     for seg in segments:
@@ -245,7 +257,7 @@ def compact_journal(
                 op = json.loads(raw)
                 verb = op.get("verb", "")
                 if _genesis_retired(op, retired):
-                    archived_lines.append(raw if raw.endswith("\n") else raw + "\n")
+                    plan.archived_lines.append(raw if raw.endswith("\n") else raw + "\n")
                     report.ops_archived_whole += 1
                     if verb == GENESIS_NODE:
                         report.nodes_archived += 1
@@ -262,12 +274,12 @@ def compact_journal(
                     report.edges_archived += n_e
                     changed = True
                     if kept_op is None:
-                        archived_lines.append(raw if raw.endswith("\n") else raw + "\n")
+                        plan.archived_lines.append(raw if raw.endswith("\n") else raw + "\n")
                         report.ops_archived_whole += 1
                         continue
                     archived_op["compaction"] = {"split": True, "label": label,
                                                  "from": Path(seg).name, "line": lineno}
-                    archived_lines.append(json.dumps(archived_op, sort_keys=True) + "\n")
+                    plan.archived_lines.append(json.dumps(archived_op, sort_keys=True) + "\n")
                     kept_op = dict(kept_op)
                     kept_op["compaction"] = {"split": True, "label": label, "archived_nodes": n_n,
                                              "archived_edges": n_e}
@@ -281,14 +293,13 @@ def compact_journal(
                     report.dangling.append(DanglingRef(segment=seg, line=lineno, verb=verb, ids=refs))
                 kept.append(kept_text)
         if changed:
-            rewrites[seg] = (kept, stamp)
+            plan.rewrites[seg] = (kept, stamp)
             report.segments_rewritten += 1
             report.raw_bytes_after += sum(len(x.encode("utf-8")) for x in kept)
         else:
             report.raw_bytes_after += len(text.encode("utf-8"))
     report.retired_ids_seen = len(seen & retired)
     report.scan_seconds = time.perf_counter() - t_scan
-
     if report.dangling and not dry_run:
         sample = "; ".join(f"{Path(d.segment).name}:{d.line} {d.verb} -> {', '.join(i[:8] for i in d.ids)}"
                            for d in report.dangling[:6])
@@ -296,23 +307,33 @@ def compact_journal(
             f"compaction {label!r} REFUSED: {len(report.dangling)} kept op(s) still reference retired "
             f"ids (the retire gate should have caught these dependents) — {sample}"
             + (" …" if len(report.dangling) > 6 else ""))
-    if dry_run or not archived_lines:
-        if not dry_run:
-            report.disk_bytes_after = report.disk_bytes_before  # nothing rewritten: measured as is
-        return report
+    return plan
 
-    # Write the archive + manifest BEFORE any segment is rewritten: a crash between the
-    # two leaves duplicates (idempotent under replay), never a loss.
+
+def move_compaction(
+    plan: CompactionPlan,  # A live plan (never a dry run's)
+    actor: str = "",       # Who ran it (manifest attribution)
+) -> CompactReport:  # The plan's report, the move's own measures filled in
+    """THE STORAGE MOVE: write the archive segment + manifest, then rewrite each changed segment
+    atomically (tmp + os.replace), refusing one whose size / mtime moved since the scan. The
+    archive is written BEFORE any rewrite: a crash between the two leaves duplicates (idempotent
+    under replay), never a loss. Nothing to move: the report, measured as is."""
+    report = plan.report
+    if report.dry_run:
+        raise ValueError(f"move_compaction {report.label!r}: a dry run's plan moves nothing")
+    if not plan.moves:
+        report.disk_bytes_after = report.disk_bytes_before  # nothing rewritten: measured as is
+        return report
     t_write = time.perf_counter()
-    Path(archive_dir).mkdir(parents=True, exist_ok=True)
-    archive_path = next_archive_path(journal_path, archive_dir)
+    Path(plan.archive_dir).mkdir(parents=True, exist_ok=True)
+    archive_path = plan.archive_path
     with open(archive_path, "w", encoding="utf-8", newline="") as out:
-        out.writelines(archived_lines)
+        out.writelines(plan.archived_lines)
         out.flush()
         os.fsync(out.fileno())
-    digest = hashlib.md5("".join(archived_lines).encode("utf-8")).hexdigest()
+    digest = hashlib.md5("".join(plan.archived_lines).encode("utf-8")).hexdigest()
     manifest = {
-        "label": label, "actor": actor, "ts": time.time(), "journal": journal_path,
+        "label": report.label, "actor": actor, "ts": time.time(), "journal": report.journal_path,
         "archive": archive_path, "archive_md5": digest,
         "retired_ids_requested": report.retired_ids_requested, "retired_ids_seen": report.retired_ids_seen,
         "ops_archived_whole": report.ops_archived_whole, "ops_split": report.ops_split,
@@ -321,18 +342,17 @@ def compact_journal(
         "disk_bytes_before": report.disk_bytes_before,
         "disk_bytes_after": None,  # measured after the rewrites, then the manifest is rewritten
         "scan_seconds": round(report.scan_seconds, 3),
-        "segments_rewritten": sorted(Path(s).name for s in rewrites),
+        "segments_rewritten": sorted(Path(s).name for s in plan.rewrites),
     }
     manifest_path = archive_path[: -len(".jsonl")] + ".manifest.json"
     Path(manifest_path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    disk_after = {s: os.stat(s).st_size for s in segments}
+    disk_after = {s: os.stat(s).st_size for s in plan.segments}
     report.archive_path = archive_path
     report.manifest_path = manifest_path
-
-    for seg, (kept, stamp) in rewrites.items():
+    for seg, (kept, stamp) in plan.rewrites.items():
         st = os.stat(seg)
         if (st.st_size, st.st_mtime) != stamp:
-            raise CompactRefusal(f"segment {seg} changed underfoot during compaction {label!r} "
+            raise CompactRefusal(f"segment {seg} changed underfoot during compaction {report.label!r} "
                                  f"(archive {archive_path} already written; the rewrite of THIS "
                                  f"segment was skipped — re-run: replay stays idempotent)")
         write_segment(seg, "".join(kept))  # atomic, in the segment's own encoding (a compressed one stays compressed)
@@ -343,6 +363,68 @@ def compact_journal(
                      "rewrite_seconds": round(report.rewrite_seconds, 3)})
     Path(manifest_path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return report
+
+
+async def compact_family(
+    writer: JournalWriter,      # An OPEN writer on the family (`async with`): the lock held, the db healed
+    archive_dir: str,           # Archive directory; MUST lie outside the backup mirror's globs
+    retired_ids: Iterable[str], # Node ids whose wires move (edges touching them move too)
+    ops: Callable[[CompactionPlan], Iterable[Dict[str, Any]]],  # The plan -> the planned ops whose apply removes the moved wires from the db
+    *,
+    label: str,                 # What this compaction is (rides the manifest + split-op markers)
+    actor: str = "",            # Who ran it (manifest attribution)
+) -> CompactReport:
+    """A db-backed family's compaction, THE OP FIRST (ruling 6683f49e (3)): under the writer's
+    lock and heal -> rotate (joining the hold) -> plan (refusing before anything is written) ->
+    append + apply + advance each op the domain plans from it (its apply deletes what moves and
+    stamps the compaction) -> only THEN the storage move -> re-stamp the cursor at the family's
+    end. The journal is self-consistent at every crash point: before the move a replay adds the
+    wires and the op deletes them; after it the op's deletes are no-ops (invariant 1 exempts
+    deletes). The ops land in the live tail, which the move never rewrites. A move with no op
+    journaled refuses: the db would keep what the journal no longer holds."""
+    if writer.position is None:
+        raise RuntimeError("compact_family: the writer is not open (`async with` it first)")
+    ids = [str(i) for i in retired_ids]
+    if ids:
+        rotate_journal(writer.path)  # joins the hold: every target now sits in a cold segment
+    plan = plan_compaction(writer.path, archive_dir, ids, label=label)
+    planned = list(ops(plan))
+    if plan.moves and not planned:
+        raise CompactRefusal(f"compaction {label!r} REFUSED: it would move "
+                             f"{plan.report.nodes_archived} node(s) and {plan.report.edges_archived} "
+                             f"edge(s) with no op journaled to remove them from the db")
+    for op in planned:
+        await writer.write(op, dedup=False)
+    report = move_compaction(plan, actor=actor)
+    if plan.moves:
+        await writer.restamp()
+    return report
+
+
+def compact_journal(
+    journal_path: str,          # The journal's live-tail path (the family is resolved from it)
+    archive_dir: str,           # Archive directory (created); MUST lie outside the backup mirror's globs
+    retired_ids: Iterable[str], # Node ids whose wires move (edges touching them move too)
+    *,
+    label: str,                 # What this compaction is (rides the manifest + split-op markers)
+    dry_run: bool = False,      # Scan + report; write nothing, rotate nothing
+    actor: str = "",            # Who ran it (manifest attribution)
+) -> CompactReport:
+    """Move every wire on the retired ids out of the journal family into ONE new archive segment
+    -- the journal-file act alone, for a family no db applies. A db-backed family compacts
+    through `compact_family`, which journals the db's side BEFORE the move (ruling 6683f49e (3)).
+
+    A live run holds the family's lock throughout (no writer interleaves with the rewrite): rotate
+    the tail (invariant 3) -> `plan_compaction` (refusing on a dangling reference, invariant 1) ->
+    `move_compaction`. A dry run is a reader: the scan only, no lock, reporting the dangling
+    references instead of refusing."""
+    ids = [str(i) for i in retired_ids]
+    if dry_run or not ids:
+        return plan_compaction(journal_path, archive_dir, ids, label=label, dry_run=dry_run).report
+    with family_lock_sync(journal_path):
+        rotate_journal(journal_path)  # close the tail: targets now sit in immutable cold segments
+        plan = plan_compaction(journal_path, archive_dir, ids, label=label)
+        return move_compaction(plan, actor=actor)
 
 
 def scan_references(

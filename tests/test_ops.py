@@ -125,27 +125,36 @@ def test_journal_extend_stamps_adds_with_the_journaled_ts(tmp_path):
     import asyncio
     from types import SimpleNamespace
 
-    from cjm_context_graph_layer.journal import journal_extend
+    from cjm_context_graph_layer.journal import journal_extend, wires_handlers
     from cjm_context_graph_primitives.journal import read_journal
     from cjm_substrate.core.queue import JobStatus
 
     class FakeQueue:
         def __init__(self):
-            self.submitted = []
+            self.submitted, self.cursors = [], {}
 
         async def submit(self, graph_id, **kw):
             self.submitted.append(kw)
             return "j1"
 
         async def wait_for_job(self, jid):  # presence queries find nothing; adds succeed
-            result = (SimpleNamespace(nodes=[], edges=[])
-                      if self.submitted[-1]["method"] == "query_nodes" else ["n1"])
+            kw = self.submitted[-1]
+            if kw["method"] == "record_journal_cursor":
+                self.cursors[kw["family"]] = kw["position"]
+                result = True
+            elif kw["method"] == "journal_cursors":
+                result = dict(self.cursors)
+            elif kw["method"] == "query_nodes":
+                result = SimpleNamespace(nodes=[], edges=[])
+            else:
+                result = ["n1"]
             return SimpleNamespace(status=JobStatus.completed, result=result, error=None)
 
     q = FakeQueue()
     j = str(tmp_path / "w.jsonl")
     asyncio.run(journal_extend(q, "g", [{"id": "n1", "label": "Seg", "properties": {}}], [],
-                               journal_path=j, verb="graph-extend", actor="test"))
+                               journal_path=j, verb="graph-extend", actor="test",
+                               handlers=wires_handlers("graph-extend")))
     ts = read_journal(j)[0]["ts"]
     added = next(kw for kw in q.submitted if kw["method"] == "add_nodes")
     assert [(n["created_at"], n["updated_at"]) for n in added["nodes"]] == [(ts, ts)]

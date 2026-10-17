@@ -16,6 +16,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - **`cjm_context_graph_layer.journal`** — Journal replay for workflow graphs — the genesis baseline + the pluggable verb registry.
 - **`cjm_context_graph_layer.ops`** — Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search.
 - **`cjm_context_graph_layer.rebuild`** — Rebuild a workflow graph db from its journal — the runnable disaster-recovery driver.
+- **`cjm_context_graph_layer.testing`** — An in-memory graph store for the write order's tests -- one fake every workflow core's suite shares.
 
 ## API
 
@@ -88,11 +89,15 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `composed_replay_handlers` _function_ — Union every installed core's replay registry (DEC 426658f1 — the d066826a fix).
 - `genesis_export` _function_ — One-time whole-db GENESIS BASELINE: journal every node + edge as genesis ops.
 - `graph_writer` _function_ — The write order on a workflow graph (design detail 65f4a6c9): a JournalWriter whose cursors
+- `installed_handlers` _function_ — Every installed core's replay registry, composed once per process (read-only). The applier of
 - `journal_extend` _function_ — Idempotent extend + journal the DELTA — the pipeline-write append-through, on the write
+- `journal_op` _function_ — Journal one planned op, then apply it -- the write order for an op whose apply is its verb's
+- `refuse_unjournaled` _function_ — The one refusal of an unjournaled default (design detail 65f4a6c9 (3)): every write path of
 - `replay_journal` _function_ — Re-apply every journaled op in append order — the db-from-journal rebuild.
 - `sidecar_journal_path` _function_ — The db's sidecar journal path (DEC ccbab9f5 point 3: placement is per-workflow,
 - `wires_handlers` _function_ — Convenience registry: every named verb replays via `apply_wires`.
 - `workflow_handlers` _function_ — The workflow lane's replay registry (ruling 6683f49e (2)): the composed union, checked
+- `write_window` _function_ — A core verb's unit of work on a workflow graph (ruling 6683f49e (1)): the family's writer --
 
 ### `cjm_context_graph_layer.ops`
 
@@ -120,6 +125,10 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `main` _function_ — The `cjm-workflow-rebuild` console entrypoint — one command, fresh db from journal.
 - `open_store` _function_ — Stand up the graph capability on `db_path` and a started queue — the cores' own runtime
 - `rebuild_db` _function_ — Rebuild `db_path` from the journal — substrate standup + composed replay.
+
+### `cjm_context_graph_layer.testing`
+
+- `MemGraph` _class_ — An in-memory graph store behind a fake queue: the storage methods the write order uses.
 
 ## Dependencies
 

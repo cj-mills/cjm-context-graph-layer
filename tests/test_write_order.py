@@ -4,63 +4,18 @@ joins the enclosing one; the declared registries checked; a replay stamps the cu
 journals its op before the storage move, under the family's lock."""
 
 import asyncio
-from types import SimpleNamespace
 
 import cjm_context_graph_layer.journal as journal_mod
 import pytest
 from cjm_context_graph_layer.compact import compact_family, CompactRefusal, scan_references
-from cjm_context_graph_layer.journal import (graph_writer, journal_extend, MissingRegistry,
-                                             replay_journal, UnjournaledWrite, wires_handlers,
-                                             workflow_handlers)
+from cjm_context_graph_layer.journal import (graph_writer, installed_handlers, journal_extend,
+                                             journal_op, MissingRegistry, replay_journal,
+                                             UnjournaledWrite, wires_handlers, workflow_handlers,
+                                             write_window)
 from cjm_context_graph_layer.ops import GraphCursorStore
+from cjm_context_graph_layer.testing import MemGraph
 from cjm_context_graph_primitives.journal import read_journal
 from cjm_context_graph_primitives.writer import FAULT_HOOK, ORIGIN, read_tail, stamp_cursor
-from cjm_substrate.core.queue import JobStatus
-
-
-class MemGraph:
-    """An in-memory graph store behind a fake queue: the storage methods the write order uses."""
-
-    def __init__(self):
-        self.nodes, self.edges, self.cursors, self.methods = {}, {}, {}, []
-
-    async def submit(self, graph_id, task=None, method=None, **kw):
-        self.methods.append(method)
-        self._result = self._run(method, kw)
-        return "j"
-
-    async def wait_for_job(self, jid):
-        return SimpleNamespace(status=JobStatus.completed, result=self._result, error=None)
-
-    def _run(self, method, kw):
-        if method == "query_nodes":
-            ids = kw["query"].get("ids") or []
-            return SimpleNamespace(nodes=[SimpleNamespace(**self.nodes[i]) for i in ids
-                                          if i in self.nodes])
-        if method == "query_edges":
-            return SimpleNamespace(rows=[{"id": i} for i in kw["query"].get("ids") or []
-                                         if i in self.edges])
-        if method in ("add_nodes", "add_edges"):
-            into = self.nodes if method == "add_nodes" else self.edges
-            items = kw["nodes"] if method == "add_nodes" else kw["edges"]
-            for w in items:
-                into[w["id"]] = {**w, "sources": w.get("sources") or []}
-            return [w["id"] for w in items]
-        if method == "delete_nodes":
-            gone = [i for i in kw["node_ids"] if self.nodes.pop(i, None) is not None]
-            for eid in [e for e, w in self.edges.items()
-                        if w["source_id"] in gone or w["target_id"] in gone]:
-                del self.edges[eid]
-            return len(gone)
-        if method == "journal_cursors":
-            return dict(self.cursors)
-        if method == "record_journal_cursor":
-            self.cursors[kw["family"]] = kw["position"]
-            return True
-        raise AssertionError(f"MemGraph: unexpected method {method}")
-
-    def state(self):  # What a comparison reads: every node and edge, as stored
-        return self.nodes, self.edges
 
 
 async def drop(queue, graph_id, op):  # A compaction op's apply: delete what moved
@@ -168,6 +123,7 @@ def test_the_declared_registries_are_checked_and_the_registry_cached(monkeypatch
     names = ["correction", "transcription"]
     monkeypatch.setattr(journal_mod, "entry_points", lambda group: [_Ep(n) for n in names])
     workflow_handlers.cache_clear()
+    installed_handlers.cache_clear()
     try:
         with pytest.raises(MissingRegistry, match=r"decomp \(cjm-transcript-decomp-core\)"):
             graph_writer(MemGraph(), "g", "w.writes.jsonl")  # refused as the writer opens
@@ -179,6 +135,7 @@ def test_the_declared_registries_are_checked_and_the_registry_cached(monkeypatch
             h["x"] = None                # read-only: one mapping serves every writer
     finally:
         workflow_handlers.cache_clear()
+        installed_handlers.cache_clear()
 
 
 def test_a_replay_stamps_the_cursor_and_refuses_an_offset_past_it(tmp_path):
@@ -256,3 +213,54 @@ def test_a_compaction_moving_wires_with_no_op_refuses(tmp_path):
     with pytest.raises(CompactRefusal, match="no op journaled"):
         asyncio.run(asyncio.wait_for(compact(), 5))
     assert "n1" in g.nodes and "n1" in journaled_nodes(j)
+
+
+async def bump(queue, graph_id, op):  # A property merge's apply: the update_node handler shape
+    await journal_mod.graph_task(queue, graph_id, "update_node", node_id=op["args"]["id"],
+                                 properties={"v": op["args"]["v"]})
+
+
+def test_journal_op_appends_then_applies_through_its_handler(tmp_path):
+    g, j = fresh(tmp_path)
+    handlers = {**HANDLERS, "bump": bump}
+    asyncio.run(extend(g, j, [node(1)]))
+    op = {"verb": "bump", "actor": "test", "args": {"id": "n1", "v": 7}}
+    landed = asyncio.run(journal_op(g, "g", op, j, handlers=handlers))
+    assert read_journal(j)[-1] == landed and landed["ts"]
+    assert g.nodes["n1"]["properties"]["v"] == 7 and g.cursors["w.writes.jsonl"]["ordinal"] == 2
+    # an A -> B -> A sequence keeps every op (17daa86b: no content dedup)
+    for v in (8, 7):
+        asyncio.run(journal_op(g, "g", {**op, "args": {"id": "n1", "v": v}}, j, handlers=handlers))
+    assert [r["args"]["v"] for r in read_journal(j)[1:]] == [7, 8, 7]
+    b = MemGraph()
+    asyncio.run(replay_journal(b, "g", j, handlers=handlers))
+    assert b.nodes["n1"]["properties"] == g.nodes["n1"]["properties"]
+
+
+def test_journal_op_unjournaled_only_when_explicit(tmp_path):
+    g = MemGraph()
+    g.nodes["n1"] = {**node(1), "sources": []}
+    op = {"verb": "bump", "actor": "test", "args": {"id": "n1", "v": 3}}
+    with pytest.raises(UnjournaledWrite, match=r"journal_op \(bump\)"):
+        asyncio.run(journal_op(g, "g", op, None, handlers={"bump": bump}))
+    assert g.methods == []  # refused before anything was read or written
+    applied = asyncio.run(journal_op(g, "g", op, None, unjournaled=True, handlers={"bump": bump}))
+    assert applied["ts"] and g.nodes["n1"]["properties"]["v"] == 3
+
+
+def test_a_write_window_is_one_unit_of_work_its_writes_join(tmp_path):
+    g, j = fresh(tmp_path)
+    handlers = {**HANDLERS, "bump": bump}
+
+    async def verb():
+        async with write_window(g, "g", j, handlers=handlers):
+            await journal_extend(g, "g", [node(1)], [], journal_path=j, verb="put", handlers=handlers)
+            await journal_op(g, "g", {"verb": "bump", "args": {"id": "n1", "v": 1}}, j,
+                             handlers=handlers)
+
+    g.methods.clear()
+    asyncio.run(asyncio.wait_for(verb(), 5))
+    assert g.methods.count("journal_cursors") == 1 and len(read_journal(j)) == 2
+    with pytest.raises(UnjournaledWrite, match=r"^some-verb: no journal path"):
+        write_window(g, "g", None, what="some-verb")
+    assert write_window(g, "g", None, unjournaled=True) is not None

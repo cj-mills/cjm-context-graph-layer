@@ -13,9 +13,10 @@ import time
 from contextlib import nullcontext
 from importlib.metadata import entry_points
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, AsyncContextManager, Callable, Dict, List, Mapping, Optional
 
-from cjm_context_graph_primitives.journal import append_op, family_lock, op_clock, read_journal
+from cjm_context_graph_primitives.journal import (append_op, family_lock, op_clock, op_now,
+                                                  read_journal)
 from cjm_context_graph_primitives.query import EdgeQuery, NodeQuery
 from cjm_context_graph_primitives.timings import record_replay, record_series, span, timed
 from cjm_context_graph_primitives.writer import (CursorMismatch, CursorStore, family_name,
@@ -260,6 +261,17 @@ class UnjournaledWrite(ValueError):
     (design detail 65f4a6c9 (3)): refused, never silently left out of the source of truth."""
 
 
+def refuse_unjournaled(
+    what: str,  # The write refused (its verb), named in the message
+) -> UnjournaledWrite:  # The refusal, for the caller to raise
+    """The one refusal of an unjournaled default (design detail 65f4a6c9 (3)): every write path of
+    a journal-sourced graph raises this when it holds no journal path and no explicit
+    `unjournaled=True`."""
+    return UnjournaledWrite(
+        f"{what}: no journal path -- a journal-sourced graph is never written unjournaled by "
+        f"default; pass unjournaled=True for a scratch build or a test (design detail 65f4a6c9 (3))")
+
+
 async def journal_extend(
     queue: Any,                   # Started job queue
     graph_id: str,                # Graph-storage capability id
@@ -288,10 +300,7 @@ async def journal_extend(
     `journal_path` the call refuses unless `unjournaled=True`, which extends with no op."""
     if not journal_path:
         if not unjournaled:
-            raise UnjournaledWrite(
-                f"journal_extend ({verb}): no journal path -- a journal-sourced graph is never "
-                f"written unjournaled by default; pass unjournaled=True for a scratch build or a "
-                f"test (design detail 65f4a6c9 (3))")
+            raise refuse_unjournaled(f"journal_extend ({verb})")
         with op_clock():
             return await extend_graph(queue, graph_id, nodes, edges)
     with op_clock():
@@ -315,6 +324,56 @@ async def _journal_extend(
                 op["run"] = run
             await w.write(op, dedup=False)
         return plan.result()
+
+
+def write_window(
+    queue: Any,                    # Started job queue
+    graph_id: str,                 # Graph-storage capability id
+    journal_path: Optional[str],   # The graph's journal family (None refuses unless `unjournaled`)
+    *,
+    unjournaled: bool = False,     # Explicitly write with no journal (scratch builds, tests)
+    handlers: Optional[Mapping[str, Callable[..., Any]]] = None,  # Replay registry (None = the workflow lane's)
+    what: str = "write_window",    # The verb it opens for, named in a refusal
+) -> AsyncContextManager[Optional[JournalWriter]]:  # `async with` it around a verb's plan and its writes
+    """A core verb's unit of work on a workflow graph (ruling 6683f49e (1)): the family's writer --
+    lock, heal -- so the verb PLANS against a db that holds its whole journal, and every journaled
+    write inside JOINS it (one cursor read, one heal); an enclosing window, an app's gesture, is
+    joined in turn. An explicitly unjournaled verb opens no writer; with neither a journal path nor
+    `unjournaled=True` the window refuses before the verb reads anything."""
+    if journal_path:
+        return graph_writer(queue, graph_id, journal_path, handlers)
+    if not unjournaled:
+        raise refuse_unjournaled(what)
+    return nullcontext()
+
+
+async def journal_op(
+    queue: Any,                    # Started job queue
+    graph_id: str,                 # Graph-storage capability id
+    op: Dict[str, Any],            # A PLANNED op: its verb's replay handler is its apply
+    journal_path: Optional[str] = None,  # The graph's journal family (None refuses unless `unjournaled`)
+    *,
+    unjournaled: bool = False,     # Explicitly write with no journal (scratch builds, tests)
+    handlers: Optional[Mapping[str, Callable[..., Any]]] = None,  # Replay registry (None = the workflow lane's)
+) -> Dict[str, Any]:  # The op as journaled (as applied, when unjournaled)
+    """Journal one planned op, then apply it -- the write order for an op whose apply is its verb's
+    replay handler (a correction, a curation act, a spine fact; ruling 6683f49e (1)): APPEND ->
+    APPLY through the handler replay dispatches to -> ADVANCE, under the family's writer, which an
+    enclosing `write_window` is joined by. A planned op is total, so its apply cannot refuse; no
+    content dedup (17daa86b) -- a verb that can be a no-change write catches it at its plan. One op
+    clock window spans it, so the op's ts is the time its apply stamps, live and on replay.
+    Explicitly unjournaled (65f4a6c9 (3)), the same handler applies it at the window's ts and
+    nothing is appended."""
+    with op_clock():
+        if journal_path:
+            async with graph_writer(queue, graph_id, journal_path, handlers) as w:
+                return await w.write(op, dedup=False)
+        if not unjournaled:
+            raise refuse_unjournaled(f"journal_op ({op.get('verb')})")
+        applied = {**op, "ts": op.get("ts") or op_now()}
+        await apply_op(queue, graph_id, applied,
+                       handlers if handlers is not None else installed_handlers())
+        return applied
 
 
 def composed_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(queue, graph_id, op)
@@ -348,6 +407,14 @@ class MissingRegistry(RuntimeError):
 
 
 @functools.lru_cache(maxsize=None)
+def installed_handlers() -> Mapping[str, Any]:  # verb -> async handler(queue, graph_id, op), read-only
+    """Every installed core's replay registry, composed once per process (read-only). The applier of
+    an explicitly unjournaled write, which never heals and never rebuilds, so it needs only the core
+    owning its own verb; `workflow_handlers` is this union checked against the declared registries."""
+    return MappingProxyType(composed_replay_handlers())
+
+
+@functools.lru_cache(maxsize=None)
 def workflow_handlers() -> Mapping[str, Any]:  # verb -> async handler(queue, graph_id, op), read-only
     """The workflow lane's replay registry (ruling 6683f49e (2)): the composed union, checked
     against the DECLARED registries the shared workflow journal needs (`WORKFLOW_REGISTRIES`) and
@@ -364,4 +431,4 @@ def workflow_handlers() -> Mapping[str, Any]:  # verb -> async handler(queue, gr
             f"{'y' if len(missing) == 1 else 'ies'} {', '.join(missing)} -- install the core into "
             f"it (an env per role, ruling 80685121): a writer here could neither heal nor rebuild "
             f"the shared workflow journal")
-    return MappingProxyType(composed_replay_handlers())
+    return installed_handlers()

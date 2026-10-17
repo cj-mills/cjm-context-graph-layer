@@ -7,7 +7,8 @@ import asyncio
 
 import cjm_context_graph_layer.journal as journal_mod
 import pytest
-from cjm_context_graph_layer.compact import compact_family, CompactRefusal, scan_references
+from cjm_context_graph_layer.compact import (compact_family, CompactRefusal, journaled_ops,
+                                             scan_references)
 from cjm_context_graph_layer.journal import (graph_writer, installed_handlers, journal_extend,
                                              journal_op, MissingRegistry, replay_journal,
                                              UnjournaledWrite, wires_handlers, workflow_handlers,
@@ -199,6 +200,42 @@ def test_a_compaction_crashed_before_its_move_replays_equal(tmp_path):
     b = MemGraph()                         # the uncompacted family: adds n1, then deletes it
     asyncio.run(replay_journal(b, "g", j, handlers=HANDLERS))
     assert sorted(g.nodes) == ["n2", "n3"] and b.state() == g.state()
+
+
+def test_a_compaction_crashed_before_its_move_completes_from_its_journaled_op(tmp_path):
+    """Ruling 9d57273a: the crashed compaction's op stands (the db already lost n1), so the re-run
+    plans n1 from the op's deletes -- journaled_ids, no new op -- and the move completes."""
+    g, j = fresh(tmp_path)
+    arch = str(tmp_path / "archive")
+    asyncio.run(extend(g, j, [node(1)]))
+    asyncio.run(extend(g, j, [node(2)]))
+
+    def hook(point):
+        if point == "after_apply":
+            raise Crash(point)
+
+    async def compact(ids, journaled, ops):
+        async with graph_writer(g, "g", j, HANDLERS) as w:
+            return await compact_family(w, arch, ids, ops, label="t", journaled_ids=journaled)
+
+    token = FAULT_HOOK.set(hook)
+    try:
+        with pytest.raises(Crash):
+            asyncio.run(asyncio.wait_for(compact(["n1"], (), _drop_op), 5))
+    finally:
+        FAULT_HOOK.reset(token)
+    assert sorted(g.nodes) == ["n2"] and "n1" in journaled_nodes(j)  # applied, never moved
+    n_ops = len(read_journal(j))
+    pending = [i for op in journaled_ops(j, "drop") for i in op["deletes"]]
+    assert pending == ["n1"]
+    rep = asyncio.run(asyncio.wait_for(compact([], pending, lambda plan: []), 5))
+    assert rep.ops_archived_whole == 1 and rep.archive_path and "n1" not in journaled_nodes(j)
+    assert len(read_journal(j)) == n_ops - 1  # the put moved out; nothing new journaled
+    again = asyncio.run(asyncio.wait_for(compact([], pending, lambda plan: []), 5))
+    assert again.nodes_archived == 0  # already moved: plans nothing
+    b = MemGraph()
+    asyncio.run(replay_journal(b, "g", j, handlers=HANDLERS))
+    assert b.state() == g.state()
 
 
 def test_a_compaction_moving_wires_with_no_op_refuses(tmp_path):

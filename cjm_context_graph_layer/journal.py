@@ -346,8 +346,10 @@ def write_window(
     multi-op human verb: every op written inside is buffered and the unit lands at the window's
     close, appended whole, then applied, so a crash leaves all of it or none. A plan inside reads
     the db as the window opened (an op's effect is visible to the gesture's later plans only through
-    the earlier op's own plan). A unit window inside a unit joins it. Pipeline chains never open
-    one: they write op by op, a retry completing them (547f4123)."""
+    the earlier op's own plan). A unit window inside a unit joins it; one opened inside a plain
+    writer lands at its own close. A pipeline op and the Derivation planned from its own adds open
+    one (ruling 3b76b63c: a healed op adds nothing, so no retry could plan the Derivation); a chain
+    of independent ops never does -- it writes op by op, a retry completing it (547f4123)."""
     if journal_path:
         writer = graph_writer(queue, graph_id, journal_path, handlers)
         return _unit_window(writer) if unit else writer

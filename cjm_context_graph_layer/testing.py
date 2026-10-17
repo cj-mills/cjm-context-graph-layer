@@ -102,7 +102,7 @@ class MemGraph:
 
 PROOF_SESSION = "proof:"  # A step's records carry `proof:<step name>` as their session stamp
 TIME_KEYS = frozenset({"ts", "created_at", "updated_at", "started_at", "asserted_at", "observed_at",
-                       "retired_ts", "compacted_at"})  # Fields a run's own clock writes
+                       "retired_ts", "compacted_at", "landed_at"})  # Fields a run's own clock writes
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
@@ -116,10 +116,21 @@ class ProofStep:
     ops: Tuple[str, ...]     # The verbs it journals, in order -- the proof asserts exactly these
     unit: bool = False       # Its ops land as ONE atomic unit (a human gesture, ruling 3de795e4)
     retried: bool = False    # A pipeline step: re-run after any crash (it plans by presence, 547f4123)
+    units: Tuple[int, ...] = ()  # A pipeline chain's appends, each one's op count in order (an op and its Derivation as one unit, ruling 3b76b63c); () = derived from `unit`
+
+    @property
+    def groups(self) -> Tuple[int, ...]:  # Each append's op count, in order
+        if self.units:
+            return self.units
+        return (len(self.ops),) if self.unit and self.ops else (1,) * len(self.ops)
 
     @property
     def appends(self) -> int:  # How many appends it makes (one per unit, else one per op)
-        return 1 if self.unit else len(self.ops)
+        return len(self.groups)
+
+    @property
+    def tearable(self) -> bool:  # One of its appends lands two ops or more (torn_append can split it)
+        return any(g > 1 for g in self.groups)
 
 
 @dataclass
@@ -149,7 +160,7 @@ def crash_variants(
     """Every boundary a crash can fall on, as the runs that crash each step there: a unit torn
     mid-append (a step whose unit holds two ops or more), after its k-th append, after its k-th
     apply. A step with fewer boundaries than k is crashed at its last."""
-    torn = [("torn_append", 1)] if any(s.unit and len(s.ops) > 1 for s in steps) else []
+    torn = [("torn_append", 1)] if any(s.tearable for s in steps) else []
     appends = max([s.appends for s in steps] + [1])
     applies = max([len(s.ops) for s in steps] + [1])
     return (torn + [("after_append", k) for k in range(1, appends + 1)]
@@ -164,7 +175,7 @@ def _crash_of(
         return None
     point, k = variant
     if point == "torn_append":
-        return (point, 1) if step.unit and len(step.ops) > 1 else None
+        return (point, 1) if step.tearable else None
     return point, min(k, step.appends if point == "after_append" else len(step.ops))
 
 
@@ -243,6 +254,8 @@ def run_proof(
     for step in steps:  # a human write that is not one unit could be half-landed by a crash
         assert step.unit or step.retried or len(step.ops) <= 1, (
             f"{step.name}: a step journaling several ops is a unit (a human gesture) or retried (a pipeline)")
+        assert sum(step.groups) == len(step.ops) and (step.retried or not step.units), (
+            f"{step.name}: its units {step.units} must cover its ops, and only a retried chain declares them")
     run_dir.mkdir(parents=True, exist_ok=True)
     journal = str(run_dir / "live.writes.jsonl")
     counts: List[int] = []
@@ -269,9 +282,12 @@ def run_proof(
         # a step's records by their session stamp, never a count: a compaction moves earlier ones out
         new = [o for o in read_journal(journal) if o.get("session") == PROOF_SESSION + step.name]
         assert [o["verb"] for o in new] == list(step.ops), f"{step.name} journaled {[o['verb'] for o in new]}, not {list(step.ops)}"
-        if step.unit and len(step.ops) > 1:
-            assert len({o.get("unit") for o in new}) == 1 and None not in {o.get("unit") for o in new}, (
-                f"{step.name}: its ops are not one unit")
+        at = 0
+        for size in step.groups:  # each append of two ops or more landed as ONE unit
+            group = {o.get("unit") for o in new[at:at + size]}
+            assert size == 1 or (len(group) == 1 and None not in group), (
+                f"{step.name}: its ops {list(step.ops[at:at + size])} are not one unit")
+            at += size
         counts.append(len(new))
     rebuilt = str(run_dir / "rebuilt.db")
     asyncio.run(rebuild_db(rebuilt, journal, manifests))
@@ -298,7 +314,8 @@ async def _child_main(argv: List[str]) -> Dict[str, Any]:  # The child's PROOF l
                 return {"healed": w.healed, "sealed": w.sealed}
         torn = (os.path.getsize(journal) - committed_length(journal)) if Path(journal).exists() else 0
         await fn(ctx)  # its first writer seals the torn end off before anything else
-        assert committed_length(journal) == os.path.getsize(journal), "the step left a torn end"
+        assert not Path(journal).exists() or committed_length(journal) == os.path.getsize(journal), (
+            "the step left a torn end")  # a rotation with nothing appended after it leaves no tail
         return {"sealed": torn}
 
 

@@ -16,7 +16,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - **`cjm_context_graph_layer.journal`** — Journal replay for workflow graphs — the genesis baseline + the pluggable verb registry.
 - **`cjm_context_graph_layer.ops`** — Queue-touching layer operations: the shared graph_task helper (task channel), idempotent emission (emit-if-absent + verify-if-present), and extend_graph — the one primitive every graph-extending workflow commits through. Deterministic ids (see identity) make idempotency a presence check instead of a search.
 - **`cjm_context_graph_layer.rebuild`** — Rebuild a workflow graph db from its journal — the runnable disaster-recovery driver.
-- **`cjm_context_graph_layer.testing`** — An in-memory graph store for the write order's tests -- one fake every workflow core's suite shares.
+- **`cjm_context_graph_layer.testing`** — The write order's test kit, shared by every workflow core's suite.
 
 ## API
 
@@ -29,6 +29,7 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 - `archive_segments` _function_ — The archive family beside a journal: `<stem>.retired.NNNN.jsonl` under `archive_dir`.
 - `compact_family` _function_ — A db-backed family's compaction, THE OP FIRST (ruling 6683f49e (3)): under the writer's
 - `compact_journal` _function_ — Move every wire on the retired ids out of the journal family into ONE new archive segment
+- `journaled_ops` _function_ — The family's ops of ONE verb, read once (ruling 9d57273a): cold segments, then the live tail
 - `move_compaction` _function_ — THE STORAGE MOVE: write the archive segment + manifest, then rewrite each changed segment
 - `next_archive_path` _function_
 - `plan_compaction` _function_ — THE SCAN: classify every op of the family's cold segments -- moved whole, split, kept --
@@ -129,6 +130,10 @@ Domain-neutral graph-aware layer for context graphs: deterministic node identity
 ### `cjm_context_graph_layer.testing`
 
 - `MemGraph` _class_ — An in-memory graph store behind a fake queue: the storage methods the write order uses.
+- `ProofContext` _class_ — What a step's call gets: the started store, the run's journal, and the run's earlier records.
+- `ProofStep` _class_ — One step of a core's crash-proof scenario: an async `call(ctx)` -- module-level, so a child
+- `crash_variants` _function_ — Every boundary a crash can fall on, as the runs that crash each step there: a unit torn
+- `run_proof` _function_ — Run a scenario once, every step in a child process, each crashed at `variant` and then healed
 
 ## Dependencies
 

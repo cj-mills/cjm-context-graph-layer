@@ -38,8 +38,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
-from cjm_context_graph_primitives.journal import (family_lock_sync, journal_segments, read_segment,
-                                                  rotate_journal, write_segment)
+from cjm_context_graph_primitives.journal import (committed_length, family_lock_sync,
+                                                  journal_segments, read_segment, rotate_journal,
+                                                  write_segment)
 from cjm_context_graph_primitives.writer import JournalWriter
 
 from .journal import GENESIS_EDGE, GENESIS_NODE
@@ -373,6 +374,7 @@ async def compact_family(
     *,
     label: str,                 # What this compaction is (rides the manifest + split-op markers)
     actor: str = "",            # Who ran it (manifest attribution)
+    journaled_ids: Iterable[str] = (),  # Ids whose removing op already stands in the family (a crashed compaction's): they move with no new op
 ) -> CompactReport:
     """A db-backed family's compaction, THE OP FIRST (ruling 6683f49e (3)): under the writer's
     lock and heal -> rotate (joining the hold) -> plan (refusing before anything is written) ->
@@ -381,15 +383,20 @@ async def compact_family(
     end. The journal is self-consistent at every crash point: before the move a replay adds the
     wires and the op deletes them; after it the op's deletes are no-ops (invariant 1 exempts
     deletes). The ops land in the live tail, which the move never rewrites. A move with no op
-    journaled refuses: the db would keep what the journal no longer holds."""
+    journaled refuses: the db would keep what the journal no longer holds. `journaled_ids` -- the
+    ids a crashed compaction's standing op already removed from the db -- join the plan with no new
+    op (ruling 9d57273a), so a re-run completes that move from every boundary; ids already moved
+    plan nothing."""
     if writer.position is None:
         raise RuntimeError("compact_family: the writer is not open (`async with` it first)")
     ids = [str(i) for i in retired_ids]
-    if ids:
+    own = set(ids)
+    pending = [str(i) for i in journaled_ids if str(i) not in own]
+    if ids or pending:
         rotate_journal(writer.path)  # joins the hold: every target now sits in a cold segment
-    plan = plan_compaction(writer.path, archive_dir, ids, label=label)
+    plan = plan_compaction(writer.path, archive_dir, ids + pending, label=label)
     planned = list(ops(plan))
-    if plan.moves and not planned:
+    if plan.moves and not planned and not pending:
         raise CompactRefusal(f"compaction {label!r} REFUSED: it would move "
                              f"{plan.report.nodes_archived} node(s) and {plan.report.edges_archived} "
                              f"edge(s) with no op journaled to remove them from the db")
@@ -446,4 +453,26 @@ def scan_references(
                 refs = _references(_kept_reference_text(op), retired)
                 if refs:
                     out.append(DanglingRef(segment=seg, line=lineno, verb=op.get("verb", ""), ids=refs))
+    return out
+
+
+def journaled_ops(
+    journal_path: str,  # The journal's live-tail path (the family is resolved from it)
+    verb: str,          # The op verb to collect
+) -> List[Dict[str, Any]]:  # Every journaled op of that verb, in append order
+    """The family's ops of ONE verb, read once (ruling 9d57273a): cold segments, then the live tail
+    to its committed end (a torn unit is never read); a line is parsed only when it names the verb.
+    A compaction reads its own journaled facts through it -- what an earlier, crashed one removed
+    from the db but left in the family."""
+    tail = str(Path(journal_path))
+    out: List[Dict[str, Any]] = []
+    for seg in journal_segments(journal_path):
+        text = (Path(seg).read_bytes()[:committed_length(seg)].decode("utf-8") if seg == tail
+                else read_segment(seg))  # plain or compressed (f1173d0b)
+        for raw in text.splitlines():
+            if verb not in raw:
+                continue
+            op = json.loads(raw)
+            if op.get("verb") == verb:
+                out.append(op)
     return out

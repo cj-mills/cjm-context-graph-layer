@@ -264,3 +264,59 @@ def test_a_write_window_is_one_unit_of_work_its_writes_join(tmp_path):
     with pytest.raises(UnjournaledWrite, match=r"^some-verb: no journal path"):
         write_window(g, "g", None, what="some-verb")
     assert write_window(g, "g", None, unjournaled=True) is not None
+
+
+def test_a_unit_window_lands_a_gesture_whole_its_core_windows_joined(tmp_path):
+    # ruling 3de795e4: an app's gesture opens a unit; the core verbs' own windows and writes join it
+    g, j = fresh(tmp_path)
+    handlers = {**HANDLERS, "bump": bump}
+
+    async def gesture():
+        async with write_window(g, "g", j, handlers=handlers, unit=True):
+            await journal_extend(g, "g", [node(1)], [], journal_path=j, verb="put", handlers=handlers)
+            async with write_window(g, "g", j, handlers=handlers, unit=True):  # a core's 2-op window
+                await journal_op(g, "g", {"verb": "bump", "args": {"id": "n1", "v": 1}}, j,
+                                 handlers=handlers)
+            assert read_journal(j) == [] and "n1" not in g.nodes  # nothing lands before the close
+
+    g.methods.clear()
+    asyncio.run(asyncio.wait_for(gesture(), 5))
+    recs = read_journal(j)
+    assert [r["verb"] for r in recs] == ["put", "bump"] and len({r["unit"] for r in recs}) == 1
+    assert g.nodes["n1"]["properties"]["v"] == 1 and g.methods.count("journal_cursors") == 1
+    b = MemGraph()
+    asyncio.run(replay_journal(b, "g", j, handlers=handlers))
+    assert b.nodes == g.nodes
+
+
+@pytest.mark.parametrize("point", ["torn_append", "after_append", "after_apply"])
+def test_a_crashed_unit_window_replays_equal_to_live_whole_or_none(tmp_path, point):
+    g, j = fresh(tmp_path)
+    handlers = {**HANDLERS, "bump": bump}
+    asyncio.run(extend(g, j, [node(1)]))
+
+    async def gesture():
+        async with write_window(g, "g", j, handlers=handlers, unit=True):
+            await journal_op(g, "g", {"verb": "bump", "args": {"id": "n1", "v": 2}}, j, handlers=handlers)
+            await journal_extend(g, "g", [node(2)], [], journal_path=j, verb="put", handlers=handlers)
+
+    def hook(p):
+        if p == point:
+            raise Crash(p)
+
+    token = FAULT_HOOK.set(hook)
+    try:
+        with pytest.raises(Crash):
+            asyncio.run(gesture())
+    finally:
+        FAULT_HOOK.reset(token)
+    b = MemGraph()  # a rebuild before any writer healed: a torn unit is never read
+    asyncio.run(replay_journal(b, "g", j, handlers=handlers))
+    whole = point != "torn_append"
+    assert ("n2" in b.nodes) == whole and b.nodes["n1"]["properties"].get("v") == (2 if whole else None)
+    asyncio.run(journal_extend(g, "g", [node(3)], [], journal_path=j, verb="put",  # the next writer
+                               handlers=handlers))  # seals, heals, then writes
+    c = MemGraph()
+    asyncio.run(replay_journal(c, "g", j, handlers=handlers))
+    assert c.nodes == g.nodes and ("n2" in g.nodes) == whole
+    assert [r["verb"] for r in read_journal(j)] == ["put"] + (["bump", "put"] if whole else []) + ["put"]

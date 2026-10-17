@@ -10,10 +10,10 @@ discipline live in `cjm_context_graph_primitives.journal`.
 
 import functools
 import time
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from importlib.metadata import entry_points
 from types import MappingProxyType
-from typing import Any, AsyncContextManager, Callable, Dict, List, Mapping, Optional
+from typing import Any, AsyncContextManager, AsyncIterator, Callable, Dict, List, Mapping, Optional
 
 from cjm_context_graph_primitives.journal import (append_op, family_lock, op_clock, op_now,
                                                   read_journal)
@@ -334,17 +334,35 @@ def write_window(
     unjournaled: bool = False,     # Explicitly write with no journal (scratch builds, tests)
     handlers: Optional[Mapping[str, Callable[..., Any]]] = None,  # Replay registry (None = the workflow lane's)
     what: str = "write_window",    # The verb it opens for, named in a refusal
+    unit: bool = False,            # A human gesture's window: its writes land as ONE atomic unit (ruling 3de795e4)
 ) -> AsyncContextManager[Optional[JournalWriter]]:  # `async with` it around a verb's plan and its writes
     """A core verb's unit of work on a workflow graph (ruling 6683f49e (1)): the family's writer --
     lock, heal -- so the verb PLANS against a db that holds its whole journal, and every journaled
     write inside JOINS it (one cursor read, one heal); an enclosing window, an app's gesture, is
     joined in turn. An explicitly unjournaled verb opens no writer; with neither a journal path nor
-    `unjournaled=True` the window refuses before the verb reads anything."""
+    `unjournaled=True` the window refuses before the verb reads anything.
+
+    With `unit=True` the window is an ATOMIC UNIT (ruling 3de795e4) -- an app's gesture, a core's
+    multi-op human verb: every op written inside is buffered and the unit lands at the window's
+    close, appended whole, then applied, so a crash leaves all of it or none. A plan inside reads
+    the db as the window opened (an op's effect is visible to the gesture's later plans only through
+    the earlier op's own plan). A unit window inside a unit joins it. Pipeline chains never open
+    one: they write op by op, a retry completing them (547f4123)."""
     if journal_path:
-        return graph_writer(queue, graph_id, journal_path, handlers)
+        writer = graph_writer(queue, graph_id, journal_path, handlers)
+        return _unit_window(writer) if unit else writer
     if not unjournaled:
         raise refuse_unjournaled(what)
     return nullcontext()
+
+
+@asynccontextmanager
+async def _unit_window(
+    writer: JournalWriter,  # The family's writer (joining an open one)
+) -> AsyncIterator[JournalWriter]:  # The writer, its writes buffered into one unit
+    async with writer as w:
+        async with w.unit():
+            yield w
 
 
 async def journal_op(
